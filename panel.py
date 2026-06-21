@@ -105,7 +105,7 @@ XRAY_RE = re.compile(
     # \(?:tcp:)? پیشوند اختیاری نسخه‌های جدید.
     # \[?...\]? تا آدرس‌های IPv6 که Xray داخل [] لاگ می‌کند (مثلاً from [2001:db8::1]:443)
     # only truly-public IPs feed the global metric, so platform-internal addrs don't skew it
-    r'from\s+(?:tcp:)?\[?([0-9a-fA-F:.]+?)\]?:\d+\s+accepted\s+\S+\s+\[([\w\-]+)\s*->[^\]]*\]\s*email:\s*'
+    r'from\s+(?:tcp:)?\[?([0-9a-fA-F:.]+?)\]?:\d+\s+accepted\s+\S+\s+\[([\w\-]+)[^\]]*\]\s*email:\s*'
     r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})',
     re.IGNORECASE
 )
