@@ -20,7 +20,6 @@ LINKS_FILE   = "/app/links.json"
 CFG_FILE     = "/app/cfg.json"
 XRAY_LOG     = "/tmp/xray_access.log"
 NGINX_LOG    = "/tmp/nginx_access.log"
-REALITY_DEBUG_LOG = "/tmp/reality_debug.log"   # لاگ تشخیصی موقت: آدرس‌های واقعی from کانفیگ Reality
 STATS_FILE   = "/app/stats.json"
 XRAY_API_PORT = 10085
 
@@ -63,7 +62,6 @@ xray_log_pos = 0
 nginx_log_pos = 0
 user_traffic = {}       
 user_last_active = {}   
-active_connections = {}    # uid -> {ip: last_seen}   فقط Reality (ایپی واقعی مستقیم از Xray)
 protocol_connections = {}  # protocol -> {ip: last_seen}  بهترین تخمین ایپی واقعی هر پروتکل از لاگ Nginx
 inbound_last_active = {}   # tag -> last_seen   آیا همین الان ترافیک از این inbound رد شده (مستقل از تشخیص ایپی)
 user_protocol_active = {}  # uid -> {protocol: last_seen}  کدام کاربر به کدام پروتکل وصل است (از لاگ Xray)
@@ -122,22 +120,6 @@ def is_public_ip(ip: str) -> bool:
     if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_reserved or addr.is_unspecified:
         return False
     if addr.version == 4 and addr in CGNAT_NET:
-        return False
-    return True
-
-def is_trackable_ip(ip: str) -> bool:
-    """For Reality (raw TCP, no X-Forwarded-For), the only per-connection identifier
-    همان آدرسی است که Xray در لاگ "from ..." ثبت می‌کند. روی پلتفرم‌هایی مثل Railway
-    این آدرس اغلب CGNAT (100.64.0.0/10) یا خصوصی است؛ is_public_ip آن‌ها را رد می‌کند و
-    باعث می‌شود شمارش Reality همیشه روی 1 بماند. اینجا فقط آدرس‌های بی‌معنی
-    (loopback / unspecified) رد می‌شوند تا اتصالات متمایز درست شمرده شوند."""
-    if not ip:
-        return False
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return False
-    if addr.is_loopback or addr.is_unspecified or addr.is_multicast or addr.is_link_local:
         return False
     return True
 
@@ -398,19 +380,34 @@ def sync_xray_config():
     save_links()
     if not reality_snis: reality_snis.add(REALITY_SNI)
     
-    ws_xh_clients = [{"id": uid, "level": 0, "email": uid} for uid in active_links.keys()]
-    reality_clients = [{"id": uid, "level": 0, "email": uid, "flow": "xtls-rprx-vision"} for uid in active_links.keys()]
-    trojan_clients = [{"password": uid, "email": uid} for uid in active_links.keys()]
-    vmess_clients = [{"id": uid, "level": 0, "email": uid, "alterId": 0} for uid in active_links.keys()]
+    # \u2500\u2500 \u0633\u0627\u062e\u062a \u0644\u06cc\u0633\u062a \u06a9\u0644\u0627\u06cc\u0646\u062a \u0647\u0631 \u067e\u0631\u0648\u062a\u06a9\u0644 \u0641\u0642\u0637 \u0627\u0632 \u06a9\u0627\u0631\u0628\u0631\u0627\u0646\u06cc \u06a9\u0647 \u0622\u0646 \u06a9\u0627\u0646\u0641\u06cc\u06af \u0628\u0631\u0627\u06cc\u0634\u0627\u0646 \u0645\u062c\u0627\u0632 \u0627\u0633\u062a \u2500\u2500
+    # \u0628\u0627\u06af \u0642\u0628\u0644\u06cc: \u0647\u0645\u0647\u0654 inbound\u200c\u0647\u0627 \u0627\u0632 active_links.keys() \u0627\u0633\u062a\u0641\u0627\u062f\u0647 \u0645\u06cc\u200c\u06a9\u0631\u062f\u0646\u062f\u060c \u067e\u0633 allowed_configs \u0628\u06cc\u200c\u0627\u062b\u0631 \u0628\u0648\u062f
+    # \u0648 \u0647\u0631 \u06a9\u0627\u0631\u0628\u0631 \u0631\u0648\u06cc \u0647\u0645\u0647\u0654 \u067e\u0631\u0648\u062a\u06a9\u0644\u200c\u0647\u0627 \u0633\u0627\u062e\u062a\u0647 \u0645\u06cc\u200c\u0634\u062f. \u062d\u0627\u0644\u0627 \u062a\u06cc\u06a9\u200c\u0647\u0627\u06cc \u0633\u0627\u062e\u062a/\u0648\u06cc\u0631\u0627\u06cc\u0634 \u06a9\u0627\u0631\u0628\u0631 \u0648\u0627\u0642\u0639\u0627\u064b \u0627\u0639\u0645\u0627\u0644 \u0645\u06cc\u200c\u0634\u0648\u0646\u062f.
+    def _user_allows(info, key):
+        ac = info.get("allowed_configs")
+        if not ac:  # \u062e\u0627\u0644\u06cc \u06cc\u0627 \u062a\u0639\u0631\u06cc\u0641\u200c\u0646\u0634\u062f\u0647 = \u0633\u0627\u0632\u06af\u0627\u0631\u06cc \u0628\u0627 \u06af\u0630\u0634\u062a\u0647: \u0647\u0645\u0647 \u0645\u062c\u0627\u0632
+            return True
+        return key in ac
+
+    ws_clients     = [{"id": uid, "level": 0, "email": uid} for uid, info in active_links.items() if _user_allows(info, "ws")]
+    xhttp_clients  = [{"id": uid, "level": 0, "email": uid} for uid, info in active_links.items() if _user_allows(info, "xhttp")]
+    grpc_clients   = [{"id": uid, "level": 0, "email": uid} for uid, info in active_links.items() if _user_allows(info, "grpc")]
+    hu_clients     = [{"id": uid, "level": 0, "email": uid} for uid, info in active_links.items() if _user_allows(info, "hu")]
+    trojan_clients = [{"password": uid, "email": uid} for uid, info in active_links.items() if _user_allows(info, "trojan")]
+    vmess_clients  = [{"id": uid, "level": 0, "email": uid, "alterId": 0} for uid, info in active_links.items() if _user_allows(info, "vmess")]
+    # Reality (vision \u0648 xhttp-over-reality) \u2014 \u06a9\u0627\u0631\u0628\u0631\u0627\u0646\u06cc \u06a9\u0647 \u062d\u062f\u0627\u0642\u0644 \u06cc\u06a9\u06cc \u0627\u0632 reality / xhttp_reality \u0628\u0631\u0627\u06cc\u0634\u0627\u0646 \u0645\u062c\u0627\u0632 \u0627\u0633\u062a
+    _reality_allowed = [uid for uid, info in active_links.items() if (_user_allows(info, "reality") or _user_allows(info, "xhttp_reality"))]
+    reality_clients = [{"id": uid, "level": 0, "email": uid, "flow": "xtls-rprx-vision"} for uid in _reality_allowed]
+    xhttp_reality_clients = [{"id": uid, "level": 0, "email": uid} for uid in _reality_allowed]
     
     inbounds = [
-        {"port": XRAY_WS_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "ws-in", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/ws"}}},
-        {"port": XRAY_XH_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "xhttp-in", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}}},
-        {"port": XRAY_GRPC_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "grpc-in", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "grpc", "grpcSettings": {"serviceName": "grpc"}}},
-        {"port": XRAY_HU_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "hu-in", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "httpupgrade", "httpupgradeSettings": {"path": "/hu"}}},
+        {"port": XRAY_WS_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "ws-in", "settings": {"clients": ws_clients, "decryption": "none"}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/ws"}}},
+        {"port": XRAY_XH_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "xhttp-in", "settings": {"clients": xhttp_clients, "decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}}},
+        {"port": XRAY_GRPC_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "grpc-in", "settings": {"clients": grpc_clients, "decryption": "none"}, "streamSettings": {"network": "grpc", "grpcSettings": {"serviceName": "grpc"}}},
+        {"port": XRAY_HU_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "hu-in", "settings": {"clients": hu_clients, "decryption": "none"}, "streamSettings": {"network": "httpupgrade", "httpupgradeSettings": {"path": "/hu"}}},
         {"port": XRAY_TJ_PORT, "listen": "127.0.0.1", "protocol": "trojan", "tag": "trojan-in", "settings": {"clients": trojan_clients}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/tj"}}},
         {"port": XRAY_VM_PORT, "listen": "127.0.0.1", "protocol": "vmess", "tag": "vmess-in", "settings": {"clients": vmess_clients}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/vm"}}},
-        {"port": XRAY_XH_INTERNAL_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "xhttp-internal-in", "settings": {"clients": ws_xh_clients, "decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}}}
+        {"port": XRAY_XH_INTERNAL_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "xhttp-internal-in", "settings": {"clients": xhttp_reality_clients, "decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}}}
     ]
     
     if reality_keys["priv"]:
@@ -600,71 +597,24 @@ async def stats_updater():
             new_data, xray_log_pos = await _read_log_segment_async(XRAY_LOG, xray_log_pos, 2 * 1024 * 1024)
             if new_data:
                 now_t = time.time()
-                _reality_dbg_seen = []   # [DEBUG] (uid, ip) های Reality دیده‌شده در این دور
                 for m in XRAY_RE.finditer(new_data):
                     ip, tag, uid = m.group(1), m.group(2), m.group(3)
                     if uid not in LINKS: continue
                     proto = TAG_TO_PROTO.get(tag)
                     if not proto: continue
 
-                    # ردیابی دقیق: کدام کاربر به کدام پروتکل وصل است
+                    # فقط تشخیص آنلاین‌بودن: کدام کاربر به کدام پروتکل وصل است.
+                    # شمارش آی‌پی Reality حذف شد (روی Railway آی‌پی واقعی در دسترس نیست و فقط بار بی‌مورد ایجاد می‌کرد).
                     if uid not in user_protocol_active:
                         user_protocol_active[uid] = {}
                     user_protocol_active[uid][proto] = now_t
                     user_last_active[uid] = now_t
-
-                    # فقط برای Reality: ایپی واقعی کاربر را هم ذخیره کن
-                    if tag == "reality-in":
-                        _reality_dbg_seen.append((uid, ip))   # [DEBUG] collect every Reality source addr
-                    if tag == "reality-in" and is_trackable_ip(ip):
-                        if uid not in active_connections:
-                            active_connections[uid] = {}
-                        active_connections[uid][ip] = now_t
-                        # only truly-public IPs feed the global metric, so platform-internal addrs don't skew it
-                        if is_public_ip(ip) and len(total_unique_ips) < 2000:
-                            total_unique_ips.add(ip)
-
-                # ===== [DEBUG موقت] ثبت آدرس‌های from کانفیگ Reality =====
-                # تا ببینیم Xray برای اتصالات Reality چه آدرس‌هایی را لاگ می‌کند و آیا متمایزند.
-                # پس از تست، کل این بلوک را می‌توان حذف کرد.
-                if _reality_dbg_seen:
-                    def _ip_class(_ip):
-                        try:
-                            a = ipaddress.ip_address(_ip)
-                        except ValueError:
-                            return "invalid"
-                        if a.is_loopback: return "loopback"
-                        if a.is_unspecified: return "unspecified"
-                        if a.version == 4 and a in CGNAT_NET: return "cgnat(100.64/10)"
-                        if a.is_private: return "private"
-                        if a.is_link_local: return "link-local"
-                        return "public"
-                    # تجمیع بر اساس کاربر -> مجموعهٔ آدرس‌ها
-                    _per_user = {}
-                    for _uid, _ip in _reality_dbg_seen:
-                        _per_user.setdefault(_uid, set()).add(_ip)
-                    _ts = datetime.now().isoformat(timespec="seconds")
-                    for _uid, _ips in _per_user.items():
-                        _label = LINKS.get(_uid, {}).get("label", _uid[:8])
-                        _detail = ", ".join(f"{_ip} [{_ip_class(_ip)}]" for _ip in sorted(_ips))
-                        _msg = f"[REALITY-DEBUG] user={_label} distinct_from_ips={len(_ips)} -> {_detail}"
-                        log_err(_msg)
-                        try:
-                            with open(REALITY_DEBUG_LOG, "a") as _f:
-                                _f.write(f"{_ts} {_msg}\n")
-                        except Exception:
-                            pass
-                # ===== پایان بلوک دیباگ =====
         except: pass
 
         # ۴. پاکسازی حافظه
         now = time.time()
         for uid in list(user_last_active.keys()):
             if now - user_last_active[uid] > 60: del user_last_active[uid]
-        for uid in list(active_connections.keys()):
-            for ip in list(active_connections[uid].keys()):
-                if now - active_connections[uid][ip] > 60: del active_connections[uid][ip]
-            if not active_connections[uid]: del active_connections[uid]
         for proto in list(protocol_connections.keys()):
             for ip in list(protocol_connections[proto].keys()):
                 if now - protocol_connections[proto][ip] > 60: del protocol_connections[proto][ip]
@@ -698,14 +648,6 @@ async def stats_updater():
         for uid, info in LINKS.items():
             if info.get("status") != "active": continue
             ip_limit = int(info.get("ip_limit", 0) or 0)
-            if ip_limit > 0:
-                # \u0641\u0642\u0637 \u0622\u06cc\u200c\u067e\u06cc\u200c\u0647\u0627\u06cc \u0639\u0645\u0648\u0645\u06cc \u0648\u0627\u0642\u0639\u06cc \u0645\u0644\u0627\u06a9 \u0633\u0642\u0641 \u062f\u0633\u062a\u06af\u0627\u0647 \u0647\u0633\u062a\u0646\u062f. \u0631\u0648\u06cc Railway (\u0641\u0642\u0637 CGNAT) \u0627\u06cc\u0646 \u0644\u06cc\u0633\u062a \u062e\u0627\u0644\u06cc \u0645\u06cc\u200c\u0645\u0627\u0646\u062f
-                # \u0648 ip_limit \u0628\u06cc\u200c\u0627\u062b\u0631 \u0645\u06cc\u200c\u0634\u0648\u062f (\u0686\u0648\u0646 \u0634\u0645\u0627\u0631\u0634 \u0648\u0627\u0642\u0639\u06cc \u0645\u0645\u06a9\u0646 \u0646\u06cc\u0633\u062a) \u062a\u0627 \u06a9\u0627\u0631\u0628\u0631 \u0627\u0634\u062a\u0628\u0627\u0647\u06cc \u0628\u0644\u0627\u06a9 \u0646\u0634\u0648\u062f\u061b \u0631\u0648\u06cc VPS \u0628\u0627 IP \u0627\u062e\u062a\u0635\u0627\u0635\u06cc \u062f\u0631\u0633\u062a \u06a9\u0627\u0631 \u0645\u06cc\u200c\u06a9\u0646\u062f.
-                real_ips = [ip for ip in active_connections.get(uid, {}) if ip != "local" and is_public_ip(ip)]
-                if len(real_ips) > ip_limit:
-                    LINKS[uid]["status"] = "blocked"
-                    needs_restart = True
-                    
             if info.get("expiry_time") and time.time() > info["expiry_time"]: needs_restart = True
             if info.get("data_limit") and user_traffic.get(uid, 0) >= info["data_limit"]: needs_restart = True
             
@@ -941,16 +883,9 @@ def build_active_configs():
         config_label = PROTOCOL_LABELS.get(proto, proto)
 
         if proto == "reality":
+            # روی Railway آی‌پی واقعی Reality قابل تشخیص نیست — فقط «آنلاین» بدون شمارش IP
             for user in users:
-                uid = user["uid"]
-                ips = active_connections.get(uid, {})
-                public_ips = [ip for ip in ips if is_public_ip(ip)]
-                if public_ips:
-                    # \u0622\u06cc\u200c\u067e\u06cc \u0648\u0627\u0642\u0639\u06cc \u06a9\u0627\u0631\u0628\u0631 \u062f\u0631 \u062f\u0633\u062a\u0631\u0633 \u0627\u0633\u062a (\u0645\u062b\u0644\u0627\u064b VPS \u0628\u0627 IP \u0627\u062e\u062a\u0635\u0627\u0635\u06cc) \u2192 \u0634\u0645\u0627\u0631\u0634 \u062f\u0642\u06cc\u0642 \u0645\u062b\u0644 \u0628\u0642\u06cc\u0647\u0654 \u067e\u0631\u0648\u062a\u06a9\u0644\u200c\u0647\u0627
-                    items.append({"config": config_label, "label": user["label"], "ip_count": len(public_ips), "attributed": True})
-                else:
-                    # \u067e\u0634\u062a \u067e\u0631\u0648\u06a9\u0633\u06cc NAT \u067e\u0644\u062a\u0641\u0631\u0645 (\u0645\u062b\u0644 Railway) \u2192 \u0622\u06cc\u200c\u067e\u06cc \u0648\u0627\u0642\u0639\u06cc \u0642\u0627\u0628\u0644\u200c\u062a\u0634\u062e\u06cc\u0635 \u0646\u06cc\u0633\u062a\u061b \u0641\u0642\u0637 \u00ab\u0622\u0646\u0644\u0627\u06cc\u0646\u00bb \u0628\u062f\u0648\u0646 \u0639\u062f\u062f \u06af\u0645\u0631\u0627\u0647\u200c\u06a9\u0646\u0646\u062f\u0647
-                    items.append({"config": config_label, "label": user["label"], "ip_count": 0, "attributed": True, "reality_no_ip": True})
+                items.append({"config": config_label, "label": user["label"], "ip_count": 0, "attributed": True, "reality_no_ip": True})
         else:
             ip_count = len(protocol_connections.get(proto, {})) or len(users)
             if len(users) == 1:
@@ -1061,21 +996,6 @@ async def api_logs(token: Optional[str] = Cookie(None)):
         for e in list(error_log)[-15:]:
             logs.append(f"[{e['t']}] {e['e']}")
     return {"logs": logs}
-
-@app.get("/api/reality-debug")
-async def api_reality_debug(token: Optional[str] = Cookie(None)):
-    """[DEBUG موقت] آخرین آدرس‌های from لاگ‌شدهٔ Reality را برمی‌گرداند. بعد از تست حذف شود."""
-    if not auth_check(token): raise HTTPException(401)
-    lines = []
-    if os.path.exists(REALITY_DEBUG_LOG):
-        loop = asyncio.get_running_loop()
-        lines = await loop.run_in_executor(None, _tail_file_sync, REALITY_DEBUG_LOG, 200)
-    # خلاصهٔ لحظه‌ای وضعیت فعلی active_connections برای کاربران Reality
-    snapshot = {}
-    for uid, ipmap in active_connections.items():
-        label = LINKS.get(uid, {}).get("label", uid[:8])
-        snapshot[label] = {"distinct_ips": len(ipmap), "ips": list(ipmap.keys())}
-    return {"reality_debug_log": lines, "current_active_connections": snapshot}
 
 def _gql_type_str(t):
     """تبدیل ساختار تایپ introspection گرافیک‌کیوال به یک رشته خوانا مثل [MetricMeasurement!]!"""
@@ -1216,9 +1136,7 @@ async def api_links(request: Request, token: Optional[str] = Cookie(None)):
     if not auth_check(token): raise HTTPException(401)
     domain = get_domain(request); out = []
     for uid, info in LINKS.items():
-        # \u0641\u0642\u0637 \u0622\u06cc\u200c\u067e\u06cc\u200c\u0647\u0627\u06cc \u0639\u0645\u0648\u0645\u06cc \u0648\u0627\u0642\u0639\u06cc \u0634\u0645\u0631\u062f\u0647 \u0645\u06cc\u200c\u0634\u0648\u0646\u062f. \u0631\u0648\u06cc Railway \u0622\u062f\u0631\u0633 Reality \u0647\u0645\u06cc\u0634\u0647 CGNAT \u062f\u0627\u062e\u0644\u06cc (100.64.x) \u0627\u0633\u062a
-        # \u06a9\u0647 \u0622\u06cc\u200c\u067e\u06cc \u0648\u0627\u0642\u0639\u06cc \u06a9\u0627\u0631\u0628\u0631 \u0646\u06cc\u0633\u062a\u061b \u0628\u0627 \u0641\u06cc\u0644\u062a\u0631 \u0639\u0645\u0648\u0645\u06cc\u060c \u0639\u062f\u062f \u063a\u0644\u0637 (\u062a\u0627 \u06f2\u06f2 = \u0633\u0627\u06cc\u0632 pool \u0644\u0628\u0647\u0654 Railway) \u0646\u0634\u0627\u0646 \u062f\u0627\u062f\u0647 \u0646\u0645\u06cc\u200c\u0634\u0648\u062f.
-        conn_count = len([ip for ip in active_connections.get(uid, {}) if is_public_ip(ip)])
+        conn_count = 1 if uid in user_last_active else 0
         data_limit = info.get("data_limit", 0)
         used_traffic = user_traffic.get(uid, 0)
         remaining_data = (data_limit - used_traffic) if data_limit else 0
