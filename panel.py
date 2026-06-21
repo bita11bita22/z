@@ -30,9 +30,9 @@ XRAY_HU_PORT   = 18084
 XRAY_TJ_PORT   = 18085
 XRAY_VM_PORT   = 18086
 
-REALITY_PORT = int(os.environ.get("REALITY_PORT", 18443))
-REALITY_DOMAIN = os.environ.get("REALITY_DOMAIN", "")
-REALITY_PUBLIC_PORT = os.environ.get("REALITY_PUBLIC_PORT", "18443")
+RAILWAY_TCP_APPLICATION_PORT = int(os.environ.get("RAILWAY_TCP_APPLICATION_PORT", 18443))
+RAILWAY_TCP_PROXY_DOMAIN = os.environ.get("RAILWAY_TCP_PROXY_DOMAIN", "")
+RAILWAY_TCP_PROXY_PORT = os.environ.get("RAILWAY_TCP_PROXY_PORT", "18443")
 REALITY_SNI  = os.environ.get("REALITY_SNI", "yahoo.com")
 XRAY_XH_INTERNAL_PORT = 18082
 
@@ -412,7 +412,7 @@ def sync_xray_config():
     
     if reality_keys["priv"]:
         inbounds.append({
-            "port": REALITY_PORT, "listen": "0.0.0.0", "protocol": "vless", "tag": "reality-in",
+            "port": RAILWAY_TCP_APPLICATION_PORT, "listen": "0.0.0.0", "protocol": "vless", "tag": "reality-in",
             "settings": {"clients": reality_clients, "decryption": "none", "fallbacks": [{"dest": f"127.0.0.1:{XRAY_XH_INTERNAL_PORT}"}]},
             "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"show": False, "dest": f"{list(reality_snis)[0]}:443", "xver": 0, "serverNames": list(reality_snis), "privateKey": reality_keys["priv"], "shortIds": ["", "0123456789abcdef"]}}
         })
@@ -811,11 +811,11 @@ def make_links(uid: str, domain: str, label: str, sni: str, short_id: str, clean
     
     user_sni = sni or REALITY_SNI
     user_pbk = reality_keys["pub"]
-    reality = "خطا: REALITY_DOMAIN ست نشده"
-    xhttp_reality = "خطا: REALITY_DOMAIN ست نشده"
-    if REALITY_DOMAIN and user_pbk:
-        reality = f"vless://{uid}@{REALITY_DOMAIN}:{REALITY_PUBLIC_PORT}?encryption=none&security=reality&sni={user_sni}&fp=chrome&pbk={user_pbk}&sid=0123456789abcdef&type=tcp&flow=xtls-rprx-vision#{label}-Reality"
-        xhttp_reality = f"vless://{uid}@{REALITY_DOMAIN}:{REALITY_PUBLIC_PORT}?encryption=none&security=reality&sni={user_sni}&fp=chrome&pbk={user_pbk}&sid=0123456789abcdef&type=xhttp&path=%2Fxh&mode=auto#{label}-XHTTP-Reality"
+    reality = "خطا: RAILWAY_TCP_PROXY_DOMAIN ست نشده"
+    xhttp_reality = "خطا: RAILWAY_TCP_PROXY_DOMAIN ست نشده"
+    if RAILWAY_TCP_PROXY_DOMAIN and user_pbk:
+        reality = f"vless://{uid}@{RAILWAY_TCP_PROXY_DOMAIN}:{RAILWAY_TCP_PROXY_PORT}?encryption=none&security=reality&sni={user_sni}&fp=chrome&pbk={user_pbk}&sid=0123456789abcdef&type=tcp&flow=xtls-rprx-vision#{label}-Reality"
+        xhttp_reality = f"vless://{uid}@{RAILWAY_TCP_PROXY_DOMAIN}:{RAILWAY_TCP_PROXY_PORT}?encryption=none&security=reality&sni={user_sni}&fp=chrome&pbk={user_pbk}&sid=0123456789abcdef&type=xhttp&path=%2Fxh&mode=auto#{label}-XHTTP-Reality"
 
     # نقشه پروتکل -> لینک
     proto_link_map = {"ws": ws, "xhttp": xhttp, "grpc": grpc, "hu": httpupgrade, "trojan": trojan, "vmess": vmess, "reality": reality, "xhttp_reality": xhttp_reality}
@@ -1586,8 +1586,232 @@ async def panel_page(token: Optional[str] = Cookie(None)):
     html = PANEL_HTML.replace("__LOGIN_URL__", "/" + ADMIN_PATH + "/login")
     return HTMLResponse(html)
 
-@app.get("/")
-async def root(): return Response(content=b"OK", media_type="text/plain")
+LANDING_HTML = r'''<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ZodProxy | کانفیگ‌های پرسرعت و رایگان V2Ray</title>
+<meta name="description" content="ZodProxy؛ کانال تخصصی پروکسی و کانفیگ‌های پرسرعت و رایگان V2Ray، VLESS، Reality، Trojan و Shadowsocks. آپدیت روزانه، اتصال پایدار و دور زدن فیلترینگ.">
+<meta name="theme-color" content="#0f1020">
+<meta property="og:title" content="ZodProxy | کانفیگ‌های پرسرعت و رایگان">
+<meta property="og:description" content="کانفیگ‌های پرسرعت V2Ray، Reality و Trojan — رایگان و با آپدیت روزانه.">
+<meta property="og:type" content="website">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0a0a16;--bg2:#10122a;--card:rgba(255,255,255,.045);--border:rgba(255,255,255,.09);
+  --txt:#eef0ff;--muted:#9aa0c7;--accent:#7c5cff;--accent2:#22d3ee;--green:#34d399;
+  --grad:linear-gradient(135deg,#7c5cff,#22d3ee);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{
+  font-family:'Vazirmatn',system-ui,'Segoe UI',sans-serif;background:var(--bg);color:var(--txt);
+  line-height:1.85;overflow-x:hidden;-webkit-font-smoothing:antialiased;position:relative;
+}
+/* پس‌زمینه‌ی نوری ثابت (CSS خالص، بدون JS و بدون بار روی سرور) */
+body::before,body::after{content:"";position:fixed;border-radius:50%;filter:blur(90px);opacity:.40;z-index:-1;pointer-events:none}
+body::before{width:520px;height:520px;background:#7c5cff;top:-160px;right:-120px}
+body::after{width:480px;height:480px;background:#22d3ee;bottom:-180px;left:-140px}
+a{text-decoration:none;color:inherit}
+.wrap{max-width:1080px;margin:0 auto;padding:0 22px}
+/* NAV */
+nav{position:sticky;top:0;z-index:50;backdrop-filter:blur(14px);background:rgba(10,10,22,.65);border-bottom:1px solid var(--border)}
+.nav-in{display:flex;align-items:center;justify-content:space-between;height:64px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:19px}
+.logo{width:38px;height:38px;border-radius:11px;background:var(--grad);display:grid;place-items:center;font-size:20px;box-shadow:0 6px 20px rgba(124,92,255,.45)}
+.nav-cta{background:var(--grad);color:#fff;padding:9px 18px;border-radius:11px;font-weight:700;font-size:14px;transition:.2s;white-space:nowrap}
+.nav-cta:hover{transform:translateY(-2px);box-shadow:0 10px 26px rgba(124,92,255,.4)}
+/* HERO */
+.hero{text-align:center;padding:78px 0 54px}
+.pill{display:inline-flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);padding:7px 16px;border-radius:100px;font-size:13px;color:var(--muted);margin-bottom:26px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green);animation:pulse 1.8s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.hero h1{font-size:clamp(33px,6vw,60px);font-weight:800;line-height:1.25;letter-spacing:-.5px}
+.grad-txt{background:var(--grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.hero p{max-width:620px;margin:22px auto 0;color:var(--muted);font-size:clamp(15px,2.5vw,18px)}
+.btns{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-top:38px}
+.btn{display:inline-flex;align-items:center;gap:9px;padding:15px 30px;border-radius:14px;font-weight:700;font-size:16px;transition:.2s}
+.btn-main{background:var(--grad);color:#fff;box-shadow:0 12px 32px rgba(124,92,255,.42)}
+.btn-main:hover{transform:translateY(-3px);box-shadow:0 18px 40px rgba(124,92,255,.55)}
+.btn-ghost{background:var(--card);border:1px solid var(--border);color:var(--txt)}
+.btn-ghost:hover{border-color:var(--accent);transform:translateY(-3px)}
+/* STATS */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin:18px 0 10px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:24px 14px;text-align:center}
+.stat b{display:block;font-size:clamp(24px,5vw,34px);font-weight:800;background:var(--grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.stat span{font-size:13px;color:var(--muted)}
+/* SECTION */
+section{padding:60px 0}
+.sec-head{text-align:center;max-width:620px;margin:0 auto 46px}
+.sec-head h2{font-size:clamp(26px,4.5vw,40px);font-weight:800}
+.sec-head p{color:var(--muted);margin-top:12px;font-size:16px}
+/* FEATURES */
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:28px 24px;transition:.25s}
+.card:hover{transform:translateY(-5px);border-color:rgba(124,92,255,.5);background:rgba(124,92,255,.06)}
+.ico{width:54px;height:54px;border-radius:14px;display:grid;place-items:center;font-size:26px;background:rgba(124,92,255,.14);border:1px solid rgba(124,92,255,.25);margin-bottom:18px}
+.card h3{font-size:19px;font-weight:700;margin-bottom:8px}
+.card p{color:var(--muted);font-size:14.5px}
+/* PROTOCOLS */
+.chips{display:flex;flex-wrap:wrap;gap:12px;justify-content:center}
+.chip{background:var(--card);border:1px solid var(--border);padding:11px 22px;border-radius:12px;font-weight:600;font-size:15px;transition:.2s}
+.chip:hover{border-color:var(--accent2);color:var(--accent2)}
+/* STEPS */
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+.step{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:30px 24px;position:relative;overflow:hidden}
+.step-n{font-size:54px;font-weight:800;line-height:1;background:var(--grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;opacity:.85}
+.step h3{font-size:18px;font-weight:700;margin:14px 0 8px}
+.step p{color:var(--muted);font-size:14.5px}
+/* APPS */
+.apps{display:flex;flex-wrap:wrap;gap:10px;justify-content:center}
+.app{background:var(--card);border:1px solid var(--border);padding:10px 18px;border-radius:100px;font-size:14px;color:var(--muted)}
+/* CTA */
+.cta{background:linear-gradient(135deg,rgba(124,92,255,.16),rgba(34,211,238,.10));border:1px solid rgba(124,92,255,.3);border-radius:26px;padding:56px 30px;text-align:center}
+.cta h2{font-size:clamp(26px,4.5vw,40px);font-weight:800}
+.cta p{color:var(--muted);margin:14px auto 30px;max-width:520px}
+/* FOOTER */
+footer{border-top:1px solid var(--border);padding:34px 0;text-align:center;color:var(--muted);font-size:14px}
+footer .brand{justify-content:center;margin-bottom:14px;font-size:17px}
+footer a.tg{color:var(--accent2);font-weight:700}
+@media(max-width:760px){
+  .grid,.steps{grid-template-columns:1fr}
+  .stats{grid-template-columns:repeat(2,1fr)}
+  .hero{padding:54px 0 36px}
+  section{padding:46px 0}
+}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap nav-in">
+    <div class="brand"><span class="logo">⚡</span><span>ZodProxy</span></div>
+    <a class="nav-cta" href="https://t.me/ZodProxy" target="_blank" rel="noopener">عضویت در کانال</a>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="pill"><span class="dot"></span> سرورها فعال هستند • آپدیت روزانه</span>
+    <h1>کانفیگ‌های <span class="grad-txt">پرسرعت و رایگان</span><br>برای عبور از فیلترینگ</h1>
+    <p>به کانال <b>ZodProxy</b> بپیوندید و هر روز جدیدترین کانفیگ‌های V2Ray، VLESS، Reality، Trojan و Shadowsocks را با کمترین پینگ و بیشترین پایداری دریافت کنید — کاملاً رایگان.</p>
+    <div class="btns">
+      <a class="btn btn-main" href="https://t.me/ZodProxy" target="_blank" rel="noopener">📨 ورود به کانال تلگرام</a>
+      <a class="btn btn-ghost" href="#features">امکانات کانال</a>
+    </div>
+  </div>
+</header>
+
+<section style="padding-top:0">
+  <div class="wrap">
+    <div class="stats">
+      <div class="stat"><b>۲۴/۷</b><span>اتصال پایدار</span></div>
+      <div class="stat"><b>روزانه</b><span>کانفیگ تازه</span></div>
+      <div class="stat"><b>+۵</b><span>پروتکل متنوع</span></div>
+      <div class="stat"><b>۱۰۰٪</b><span>رایگان</span></div>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <div class="sec-head">
+      <h2>چرا ZodProxy؟</h2>
+      <p>هر آنچه برای یک اتصال سریع، امن و بی‌دردسر نیاز دارید، یکجا.</p>
+    </div>
+    <div class="grid">
+      <div class="card"><div class="ico">🚀</div><h3>سرعت فوق‌العاده</h3><p>کانفیگ‌های بهینه‌شده با کمترین پینگ، مناسب استریم، دانلود و گیمینگ بدون قطعی.</p></div>
+      <div class="card"><div class="ico">🔄</div><h3>آپدیت روزانه</h3><p>هر روز کانفیگ‌های تازه روی سرورهای جدید قرار می‌گیرد تا همیشه اتصال برقرار باشد.</p></div>
+      <div class="card"><div class="ico">🆓</div><h3>کاملاً رایگان</h3><p>بدون هیچ هزینه، اشتراک یا ثبت‌نام؛ کافیست عضو کانال شوید و کپی کنید.</p></div>
+      <div class="card"><div class="ico">🛡️</div><h3>امن و خصوصی</h3><p>پروتکل‌های مدرن مثل Reality و TLS برای حفظ حریم خصوصی و اتصال مخفی و مطمئن.</p></div>
+      <div class="card"><div class="ico">📱</div><h3>همه دستگاه‌ها</h3><p>سازگار با اندروید، iOS، ویندوز، مک و لینوکس از طریق محبوب‌ترین اپلیکیشن‌ها.</p></div>
+      <div class="card"><div class="ico">🌐</div><h3>عبور از فیلترینگ</h3><p>کانفیگ‌هایی که در شرایط سخت شبکه هم پایدار می‌مانند و قطع نمی‌شوند.</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="sec-head">
+      <h2>پروتکل‌های پشتیبانی‌شده</h2>
+      <p>تنوع کامل پروتکل‌ها برای هر شرایط شبکه.</p>
+    </div>
+    <div class="chips">
+      <span class="chip">VLESS</span>
+      <span class="chip">VMess</span>
+      <span class="chip">Reality</span>
+      <span class="chip">Trojan</span>
+      <span class="chip">Shadowsocks</span>
+      <span class="chip">Hysteria2</span>
+      <span class="chip">TUIC</span>
+      <span class="chip">WireGuard</span>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="sec-head">
+      <h2>در ۳ قدم متصل شوید</h2>
+      <p>بدون دانش فنی، در کمتر از یک دقیقه.</p>
+    </div>
+    <div class="steps">
+      <div class="step"><div class="step-n">۱</div><h3>عضویت در کانال</h3><p>روی دکمه «ورود به کانال تلگرام» بزنید و عضو کانال ZodProxy شوید.</p></div>
+      <div class="step"><div class="step-n">۲</div><h3>کپی کانفیگ</h3><p>جدیدترین کانفیگ یا لینک اشتراک (Subscription) را از کانال کپی کنید.</p></div>
+      <div class="step"><div class="step-n">۳</div><h3>اتصال در اپ</h3><p>کانفیگ را در اپ موردنظر Paste کرده و دکمه اتصال را بزنید. تمام!</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="sec-head">
+      <h2>اپلیکیشن‌های پیشنهادی</h2>
+      <p>با این کلاینت‌ها کانفیگ‌ها را روی هر دستگاهی اجرا کنید.</p>
+    </div>
+    <div class="apps">
+      <span class="app">📱 v2rayNG</span>
+      <span class="app">🦊 NekoBox</span>
+      <span class="app">🍏 Streisand</span>
+      <span class="app">🌀 Hiddify</span>
+      <span class="app">⚔️ Clash Meta</span>
+      <span class="app">🚀 V2Box</span>
+      <span class="app">💻 Nekoray</span>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="cta">
+      <h2>همین حالا به جمع ما بپیوند</h2>
+      <p>کانفیگ‌های پرسرعت، رایگان و آپدیت روزانه فقط یک کلیک با شما فاصله دارد.</p>
+      <a class="btn btn-main" href="https://t.me/ZodProxy" target="_blank" rel="noopener">📨 عضویت در کانال ZodProxy</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="brand"><span class="logo">⚡</span><span>ZodProxy</span></div>
+    <p>کانال تخصصی پروکسی و کانفیگ‌های پرسرعت • <a class="tg" href="https://t.me/ZodProxy" target="_blank" rel="noopener">@ZodProxy</a></p>
+    <p style="margin-top:8px;font-size:12.5px;opacity:.7">© ZodProxy — تمامی کانفیگ‌ها صرفاً جهت عبور از محدودیت‌ها و استفاده شخصی است.</p>
+  </div>
+</footer>
+
+</body>
+</html>
+'''
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    # صفحهٔ اصلی تبلیغاتی کانال ZodProxy — یک رشتهٔ استاتیک که فقط یک‌بار هنگام بالا آمدن لود می‌شود.
+    # هدر Cache-Control تا مرورگر/CDN کش کند و فشار تکراری روی CPU/رم نیاید.
+    return HTMLResponse(content=LANDING_HTML, headers={"Cache-Control": "public, max-age=3600"})
 
 @app.get("/health")
 async def health(): return {"status": "ok", "connections": len(user_last_active)}
