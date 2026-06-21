@@ -576,10 +576,16 @@ async def stats_updater():
                     except ValueError: b = 0
                     if b > 0: stats["bytes"] += b
 
-                    real_ip = remote_addr if is_public_ip(remote_addr) else ""
-                    if not real_ip and xff:
+                    # ✅ اصلاح شمارش آنلاین: روی پلتفرم‌هایی مثل Railway، آی‌پی واقعی کاربر همیشه
+                    # اولین آی‌پی در X-Forwarded-For است؛ $remote_addr فقط آی‌پی پراکسی داخلی پلتفرم
+                    # است که می‌تواند بین چند سرور edge بچرخد و یک کاربر را به‌اشتباه چند «اتصال» نشان دهد.
+                    # پس اول XFF (آی‌پی واقعی کاربر) را می‌خوانیم تا دقیقاً «آی‌پی‌های فعال یکتا» شمرده شوند،
+                    # و فقط در نبودِ XFF به remote_addr عمومی برمی‌گردیم (حالت اجرای مستقیم بدون پراکسی جلویی).
+                    real_ip = ""
+                    if xff:
                         first_ip = xff.split(",")[0].strip()
                         if is_public_ip(first_ip): real_ip = first_ip
+                    if not real_ip and is_public_ip(remote_addr): real_ip = remote_addr
                     if not real_ip: continue
 
                     if len(total_unique_ips) < 2000: total_unique_ips.add(real_ip)
@@ -609,6 +615,12 @@ async def stats_updater():
                         user_protocol_active[uid] = {}
                     user_protocol_active[uid][proto] = now_t
                     user_last_active[uid] = now_t
+
+                    # ✅ شمارش آی‌پی فعال Reality: برخلاف WS/gRPC/... که از Nginx رد می‌شوند و آی‌پیِ Xray برایشان 127.0.0.1 است،
+                    # اتصال Reality مستقیم به خود Xray می‌رسد؛ پس آی‌پی منبعِ همین لاگ Xray را می‌شماریم.
+                    # هر آی‌پی (به‌جز لوکال‌هاست) را نگه می‌داریم — روی VPS آی‌پی واقعی کاربر و روی Railway آی‌پیِ دیده‌شده شمرده می‌شود.
+                    if proto == "reality" and ip not in ("127.0.0.1", "::1", ""):
+                        protocol_connections.setdefault("reality", {})[ip] = now_t
         except: pass
 
         # ۴. پاکسازی حافظه
@@ -882,17 +894,13 @@ def build_active_configs():
         if not users: continue
         config_label = PROTOCOL_LABELS.get(proto, proto)
 
-        if proto == "reality":
-            # روی Railway آی‌پی واقعی Reality قابل تشخیص نیست — فقط «آنلاین» بدون شمارش IP
-            for user in users:
-                items.append({"config": config_label, "label": user["label"], "ip_count": 0, "attributed": True, "reality_no_ip": True})
+        # شمارش آی‌پی فعال برای همه پروتکل‌ها (شامل Reality که ایپی‌اش از لاگ Xray می‌آید).
+        ip_count = len(protocol_connections.get(proto, {})) or len(users)
+        if len(users) == 1:
+            items.append({"config": config_label, "label": users[0]["label"], "ip_count": ip_count, "attributed": True})
         else:
-            ip_count = len(protocol_connections.get(proto, {})) or len(users)
-            if len(users) == 1:
-                items.append({"config": config_label, "label": users[0]["label"], "ip_count": ip_count, "attributed": True})
-            else:
-                labels = [u["label"] for u in users[:5]]
-                items.append({"config": config_label, "label": " / ".join(labels), "ip_count": ip_count, "attributed": False})
+            labels = [u["label"] for u in users[:5]]
+            items.append({"config": config_label, "label": " / ".join(labels), "ip_count": ip_count, "attributed": False})
 
     # ──── مرحله ۲: fallback برای کاربران بدون mapping ────
     # کاربرانی که آنلاین هستند (Stats API) ولی هنوز خط accepted لاگ Xray برایشان ثبت نشده
