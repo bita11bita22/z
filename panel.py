@@ -20,6 +20,7 @@ LINKS_FILE   = "/app/links.json"
 CFG_FILE     = "/app/cfg.json"
 XRAY_LOG     = "/tmp/xray_access.log"
 NGINX_LOG    = "/tmp/nginx_access.log"
+REALITY_DEBUG_LOG = "/tmp/reality_debug.log"   # لاگ تشخیصی موقت: آدرس‌های واقعی from کانفیگ Reality
 STATS_FILE   = "/app/stats.json"
 XRAY_API_PORT = 10085
 
@@ -101,7 +102,10 @@ CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")  # RFC 6598 - Shared/CGNAT Add
 # پیشوند "tcp:" قبل از ایپی اختیاری گرفته می‌شود، و تگ inbound داخل [] هم استخراج می‌شود تا
 # بشود فقط روی reality-in فیلتر کرد (نه هر خط دیگری که به اشتباه ایپی غیر-لوکال داشته باشد).
 XRAY_RE = re.compile(
-    r'from\s+(?:tcp:)?([\d.a-fA-F:]+):\d+\s+accepted\s+\S+\s+\[([\w\-]+)\s*->[^\]]*\]\s*email:\s*'
+    # \(?:tcp:)? پیشوند اختیاری نسخه‌های جدید.
+    # \[?...\]? تا آدرس‌های IPv6 که Xray داخل [] لاگ می‌کند (مثلاً from [2001:db8::1]:443)
+    # only truly-public IPs feed the global metric, so platform-internal addrs don't skew it
+    r'from\s+(?:tcp:)?\[?([0-9a-fA-F:.]+?)\]?:\d+\s+accepted\s+\S+\s+\[([\w\-]+)\s*->[^\]]*\]\s*email:\s*'
     r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})',
     re.IGNORECASE
 )
@@ -118,6 +122,22 @@ def is_public_ip(ip: str) -> bool:
     if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_reserved or addr.is_unspecified:
         return False
     if addr.version == 4 and addr in CGNAT_NET:
+        return False
+    return True
+
+def is_trackable_ip(ip: str) -> bool:
+    """For Reality (raw TCP, no X-Forwarded-For), the only per-connection identifier
+    همان آدرسی است که Xray در لاگ "from ..." ثبت می‌کند. روی پلتفرم‌هایی مثل Railway
+    این آدرس اغلب CGNAT (100.64.0.0/10) یا خصوصی است؛ is_public_ip آن‌ها را رد می‌کند و
+    باعث می‌شود شمارش Reality همیشه روی 1 بماند. اینجا فقط آدرس‌های بی‌معنی
+    (loopback / unspecified) رد می‌شوند تا اتصالات متمایز درست شمرده شوند."""
+    if not ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if addr.is_loopback or addr.is_unspecified or addr.is_multicast or addr.is_link_local:
         return False
     return True
 
@@ -411,14 +431,12 @@ def sync_xray_config():
             # - bufferSize=64 (کیلوبایت): اندازه بافر داخلی هر اتصال؛ این مقدار دقیقاً همان عددی است که
             #   پروژه‌های مشابه Xray برای هزاران کاربر هم‌زمان روی سرورهای کم‌رم توصیه و تست کرده‌اند
             #   (پیش‌فرض اگر ست نشود می‌تواند چند برابر این مقدار رم بگیرد).
-            # bufferSize از 64KB به 16KB کاهش یافت: این اصلی‌ترین عامل رشد رم زیر بار بالاست.
-            # هر اتصال در هر جهت یک بافر می‌گیرد؛ با ۱۰۰ کاربر و ده‌ها اتصال موازی هرکدام،
-            # 64KB به‌سرعت به صدها مگابایت می‌رسد و کانتینر OOM-kill می‌شود. 16KB روی سرعت
-            # تاثیر محسوسی ندارد (کانفیگ‌های low-memory حتی 4KB استفاده می‌کنند) ولی رم را ۴ برابر کم می‌کند.
-            # connIdle از 60 به 30 ثانیه: اتصالات نیمه‌باز موبایل سریع‌تر بسته می‌شوند و بافرشان آزاد می‌شود.
+            # bufferSize از 64KB به 32KB کاهش یافت: اصلی‌ترین اهرم کاهش رم زیر بار بالا.
+            # این تغییر هیچ اتصالی را قطع نمی‌کند (فقط اندازه‌ی بافر داخلی relay است) و رم را نصف می‌کند.
+            # connIdle / uplinkOnly / downlinkOnly به مقدار اصلی و تست‌شده برگشتند تا اتصالات سالم قطع نشوند.
             "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True,
-                              "handshake": 4, "connIdle": 30, "uplinkOnly": 1, "downlinkOnly": 1,
-                              "bufferSize": 16}},
+                              "handshake": 4, "connIdle": 60, "uplinkOnly": 2, "downlinkOnly": 4,
+                              "bufferSize": 32}},
             "system": {"statsInboundUplink": True, "statsInboundDownlink": True}
         },
         "api": {"tag": "api_service", "services": ["HandlerService", "LoggerService", "StatsService"]},
@@ -582,6 +600,7 @@ async def stats_updater():
             new_data, xray_log_pos = await _read_log_segment_async(XRAY_LOG, xray_log_pos, 2 * 1024 * 1024)
             if new_data:
                 now_t = time.time()
+                _reality_dbg_seen = []   # [DEBUG] (uid, ip) های Reality دیده‌شده در این دور
                 for m in XRAY_RE.finditer(new_data):
                     ip, tag, uid = m.group(1), m.group(2), m.group(3)
                     if uid not in LINKS: continue
@@ -595,12 +614,47 @@ async def stats_updater():
                     user_last_active[uid] = now_t
 
                     # فقط برای Reality: ایپی واقعی کاربر را هم ذخیره کن
-                    if tag == "reality-in" and is_public_ip(ip):
+                    if tag == "reality-in":
+                        _reality_dbg_seen.append((uid, ip))   # [DEBUG] collect every Reality source addr
+                    if tag == "reality-in" and is_trackable_ip(ip):
                         if uid not in active_connections:
                             active_connections[uid] = {}
                         active_connections[uid][ip] = now_t
-                        if len(total_unique_ips) < 2000:
+                        # only truly-public IPs feed the global metric, so platform-internal addrs don't skew it
+                        if is_public_ip(ip) and len(total_unique_ips) < 2000:
                             total_unique_ips.add(ip)
+
+                # ===== [DEBUG موقت] ثبت آدرس‌های from کانفیگ Reality =====
+                # تا ببینیم Xray برای اتصالات Reality چه آدرس‌هایی را لاگ می‌کند و آیا متمایزند.
+                # پس از تست، کل این بلوک را می‌توان حذف کرد.
+                if _reality_dbg_seen:
+                    def _ip_class(_ip):
+                        try:
+                            a = ipaddress.ip_address(_ip)
+                        except ValueError:
+                            return "invalid"
+                        if a.is_loopback: return "loopback"
+                        if a.is_unspecified: return "unspecified"
+                        if a.version == 4 and a in CGNAT_NET: return "cgnat(100.64/10)"
+                        if a.is_private: return "private"
+                        if a.is_link_local: return "link-local"
+                        return "public"
+                    # تجمیع بر اساس کاربر -> مجموعهٔ آدرس‌ها
+                    _per_user = {}
+                    for _uid, _ip in _reality_dbg_seen:
+                        _per_user.setdefault(_uid, set()).add(_ip)
+                    _ts = datetime.now().isoformat(timespec="seconds")
+                    for _uid, _ips in _per_user.items():
+                        _label = LINKS.get(_uid, {}).get("label", _uid[:8])
+                        _detail = ", ".join(f"{_ip} [{_ip_class(_ip)}]" for _ip in sorted(_ips))
+                        _msg = f"[REALITY-DEBUG] user={_label} distinct_from_ips={len(_ips)} -> {_detail}"
+                        log_err(_msg)
+                        try:
+                            with open(REALITY_DEBUG_LOG, "a") as _f:
+                                _f.write(f"{_ts} {_msg}\n")
+                        except Exception:
+                            pass
+                # ===== پایان بلوک دیباگ =====
         except: pass
 
         # ۴. پاکسازی حافظه
@@ -998,6 +1052,21 @@ async def api_logs(token: Optional[str] = Cookie(None)):
         for e in list(error_log)[-15:]:
             logs.append(f"[{e['t']}] {e['e']}")
     return {"logs": logs}
+
+@app.get("/api/reality-debug")
+async def api_reality_debug(token: Optional[str] = Cookie(None)):
+    """[DEBUG موقت] آخرین آدرس‌های from لاگ‌شدهٔ Reality را برمی‌گرداند. بعد از تست حذف شود."""
+    if not auth_check(token): raise HTTPException(401)
+    lines = []
+    if os.path.exists(REALITY_DEBUG_LOG):
+        loop = asyncio.get_running_loop()
+        lines = await loop.run_in_executor(None, _tail_file_sync, REALITY_DEBUG_LOG, 200)
+    # خلاصهٔ لحظه‌ای وضعیت فعلی active_connections برای کاربران Reality
+    snapshot = {}
+    for uid, ipmap in active_connections.items():
+        label = LINKS.get(uid, {}).get("label", uid[:8])
+        snapshot[label] = {"distinct_ips": len(ipmap), "ips": list(ipmap.keys())}
+    return {"reality_debug_log": lines, "current_active_connections": snapshot}
 
 def _gql_type_str(t):
     """تبدیل ساختار تایپ introspection گرافیک‌کیوال به یک رشته خوانا مثل [MetricMeasurement!]!"""
