@@ -30,9 +30,9 @@ XRAY_HU_PORT   = 18084
 XRAY_TJ_PORT   = 18085
 XRAY_VM_PORT   = 18086
 
-RAILWAY_TCP_APPLICATION_PORT = int(os.environ.get("RAILWAY_TCP_APPLICATION_PORT", 18443))
-RAILWAY_TCP_PROXY_DOMAIN = os.environ.get("RAILWAY_TCP_PROXY_DOMAIN", "")
-RAILWAY_TCP_PROXY_PORT = os.environ.get("RAILWAY_TCP_PROXY_PORT", "18443")
+REALITY_PORT = int(os.environ.get("REALITY_PORT", 18443))
+REALITY_DOMAIN = os.environ.get("REALITY_DOMAIN", "")
+REALITY_PUBLIC_PORT = os.environ.get("REALITY_PUBLIC_PORT", "18443")
 REALITY_SNI  = os.environ.get("REALITY_SNI", "yahoo.com")
 XRAY_XH_INTERNAL_PORT = 18082
 
@@ -54,14 +54,19 @@ PASS_HASH = hashlib.sha256(ADMIN_PASS.encode()).hexdigest()
 SESSIONS = {}
 LINKS = {}
 error_log = deque(maxlen=50)
-stats = {"bytes": 0, "bytes_prev": 0, "bytes_prev_time": time.time(), "dl_speed": 0, "ul_speed": 0, "start": time.time()}
-sys_info = {"ram": 0, "cpu": 0, "disk_used_gb": 0, "disk_total_gb": 0, "disk_pct": 0, "ram_used_mb": 0, "ram_limit_mb": 0}
+stats = {"bytes": 0, "bytes_prev": 0, "bytes_prev_time": time.time(), "dl_speed": 0, "ul_speed": 0, "start": time.time(),
+         # شمارنده‌های مجزای دانلود/آپلود از خود Xray (برای محاسبهٔ سرعت واقعی به‌جای تخمین ساختگی ۶۵/۳۵)
+         "down_bytes": 0, "up_bytes": 0, "down_prev": 0, "up_prev": 0}
+sys_info = {"ram": 0, "cpu": 0, "cpu_cores": 0, "disk_used_gb": 0, "disk_total_gb": 0, "disk_pct": 0, "ram_used_mb": 0, "ram_limit_mb": 0}
 prev_cpu = None
+_prev_cpu_usage = None  # (usage_usec, wall_time) برای محاسبهٔ CPU واقعی کانتینر از cgroup
+_cg_base_cache = None   # مسیر پایهٔ cgroup v2 (یک‌بار حل می‌شود)
 xray_process = None
 xray_log_pos = 0
 nginx_log_pos = 0
 user_traffic = {}       
 user_last_active = {}   
+active_connections = {}    # uid -> {ip: last_seen}   فقط Reality (ایپی واقعی مستقیم از Xray)
 protocol_connections = {}  # protocol -> {ip: last_seen}  بهترین تخمین ایپی واقعی هر پروتکل از لاگ Nginx
 inbound_last_active = {}   # tag -> last_seen   آیا همین الان ترافیک از این inbound رد شده (مستقل از تشخیص ایپی)
 user_protocol_active = {}  # uid -> {protocol: last_seen}  کدام کاربر به کدام پروتکل وصل است (از لاگ Xray)
@@ -100,10 +105,7 @@ CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")  # RFC 6598 - Shared/CGNAT Add
 # پیشوند "tcp:" قبل از ایپی اختیاری گرفته می‌شود، و تگ inbound داخل [] هم استخراج می‌شود تا
 # بشود فقط روی reality-in فیلتر کرد (نه هر خط دیگری که به اشتباه ایپی غیر-لوکال داشته باشد).
 XRAY_RE = re.compile(
-    # \(?:tcp:)? پیشوند اختیاری نسخه‌های جدید.
-    # \[?...\]? تا آدرس‌های IPv6 که Xray داخل [] لاگ می‌کند (مثلاً from [2001:db8::1]:443)
-    # only truly-public IPs feed the global metric, so platform-internal addrs don't skew it
-    r'from\s+(?:tcp:)?\[?([0-9a-fA-F:.]+?)\]?:\d+\s+accepted\s+\S+\s+\[([\w\-]+)[^\]]*\]\s*email:\s*'
+    r'from\s+(?:tcp:)?([\d.a-fA-F:]+):\d+\s+accepted\s+\S+\s+\[([\w\-]+)\s*->[^\]]*\]\s*email:\s*'
     r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})',
     re.IGNORECASE
 )
@@ -149,64 +151,156 @@ def sanitize_label(label: str) -> str:
     return re.sub(r'[^\w\s\-@.]', '', label)[:30]
 
 # ── System Info (RAM/CPU) ────────────────────────────────
-def get_cgroup_mem():
-    """
-    رم *واقعی کانتینر* را از خود cgroup می‌خواند (نه از /proc/meminfo که در داکر/ریلوی
-    رم کل ماشین میزبان را نشان می‌دهد، نه سهم این کانتینر).
-    این دقیقاً همان عددی است که کرنل برای OOM-kill کردن کانتینر استفاده می‌کند، پس با
-    چیزی که در داشبورد ریلوی می‌بینید (که می‌رود بالای ۹۰٪ و کرش می‌کند) یکی است؛
-    بر خلاف /proc/meminfo که چون رم کل ماشین فیزیکی زیرین را نشان می‌دهد، معمولاً
-    ثابت و کوچک به نظر می‌رسد (مثلاً همان ۴۰٪ ثابتی که در پنل می‌بینید) و اصلاً
-    فشار واقعی رم *این کانتینر* را نشان نمی‌دهد.
-    خروجی: (used_bytes, limit_bytes) یا None اگر هیچ محدودیت cgroup واقعی پیدا نشد
-    (یعنی خارج از کانتینر اجرا می‌شود، یا limit ست نشده).
-    """
-    def _read_stat_field(path, field):
-        try:
-            with open(path) as f:
-                for line in f:
-                    if line.startswith(field + " "):
-                        return int(line.split()[1])
-        except Exception:
-            pass
-        return 0
-
-    # cgroup v2
+def _read_stat_field(path, field):
+    """یک فیلد خاص را از فایل‌های stat سبک cgroup می‌خواند (مثل inactive_file / usage_usec)."""
     try:
-        cur_path, max_path = "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"
-        if os.path.exists(cur_path) and os.path.exists(max_path):
-            with open(cur_path) as f: used = int(f.read().strip())
-            limit_raw = open(max_path).read().strip()
-            if limit_raw != "max":
-                limit = int(limit_raw)
-                # کش قابل‌بازیابی (inactive_file) را کم می‌کنیم تا فقط مصرف «واقعی» بماند
-                # (دقیقاً همان منطقی که docker stats / cAdvisor استفاده می‌کنند)
-                inactive_file = _read_stat_field("/sys/fs/cgroup/memory.stat", "inactive_file")
-                used_real = max(0, used - inactive_file)
-                if limit > 0:
-                    return used_real, limit
+        with open(path) as f:
+            for line in f:
+                if line.startswith(field + " "):
+                    return int(line.split()[1])
     except Exception:
         pass
+    return 0
 
+def _cgroup_v2_base():
+    """
+    مسیر پایهٔ cgroup v2 *همین پروسه* را برمی‌گرداند.
+    نکتهٔ کلیدی: در داکر/ریلوی پروسه معمولاً در یک cgroup تو‌در‌تو (مثل /user) قرار دارد،
+    نه در ریشهٔ /sys/fs/cgroup. کد قبلی از ریشه می‌خواند که آنجا memory.current خالی بود و
+    به همین خاطر به /proc/meminfo (رم کل ماشین) برمی‌گشت. اینجا مسیر واقعی را از
+    /proc/self/cgroup حل می‌کنیم تا متریک‌های *خود کانتینر* خوانده شوند.
+    """
+    global _cg_base_cache
+    if _cg_base_cache is not None:
+        return _cg_base_cache or None
+    base = ""
+    try:
+        with open("/proc/self/cgroup") as f:
+            for line in f:
+                parts = line.strip().split(":", 2)
+                # cgroup v2 یک خط دارد:  0::/some/nested/path
+                if len(parts) == 3 and parts[0] == "0":
+                    rel = parts[2] or "/"
+                    cand = "/sys/fs/cgroup" + rel
+                    if os.path.exists(os.path.join(cand, "memory.current")) or \
+                       os.path.exists(os.path.join(cand, "cpu.stat")):
+                        base = cand
+                    break
+    except Exception:
+        pass
+    if not base:
+        # fallback: ریشه (وقتی پروسه واقعاً در ریشه است)
+        if os.path.exists("/sys/fs/cgroup/memory.current") or os.path.exists("/sys/fs/cgroup/cpu.stat"):
+            base = "/sys/fs/cgroup"
+    _cg_base_cache = base
+    return base or None
+
+def _count_cpuset(base):
+    """تعداد هسته‌های مجاز کانتینر را از cpuset.cpus.effective می‌شمارد (مثل '0-1' یا '0,2-3')."""
+    for name in ("cpuset.cpus.effective", "cpuset.cpus"):
+        try:
+            raw = open(os.path.join(base, name)).read().strip()
+            if not raw:
+                continue
+            n = 0
+            for part in raw.split(","):
+                if "-" in part:
+                    a, b = part.split("-"); n += int(b) - int(a) + 1
+                else:
+                    n += 1
+            if n > 0:
+                return n
+        except Exception:
+            continue
+    return 0
+
+def get_cgroup_mem():
+    """
+    رم *واقعی کانتینر* را از cgroup خودِ پروسه می‌خواند (مسیر تو‌در‌تو را درست حل می‌کند).
+    این همان عددی است که کرنل برای OOM-kill استفاده می‌کند و با چیزی که در داشبورد ریلوی
+    می‌بینید یکی است؛ برخلاف /proc/meminfo که رم کل ماشین فیزیکی را نشان می‌داد (فیک).
+    خروجی: (used_bytes, limit_bytes) یا None اگر هیچ محدودیت cgroup واقعی پیدا نشد.
+    """
+    base = _cgroup_v2_base()
+    # cgroup v2 (مسیر صحیحِ تو‌در‌تو)
+    if base:
+        try:
+            cur_path = os.path.join(base, "memory.current")
+            max_path = os.path.join(base, "memory.max")
+            if os.path.exists(cur_path) and os.path.exists(max_path):
+                cur_raw = open(cur_path).read().strip()
+                limit_raw = open(max_path).read().strip()
+                if cur_raw and limit_raw and limit_raw != "max":
+                    used = int(cur_raw); limit = int(limit_raw)
+                    # کشِ قابل‌بازیابی (inactive_file) را کم می‌کنیم تا فقط مصرف «واقعی» بماند
+                    # (همان منطقی که docker stats / cAdvisor استفاده می‌کنند)
+                    inactive_file = _read_stat_field(os.path.join(base, "memory.stat"), "inactive_file")
+                    used_real = max(0, used - inactive_file)
+                    if limit > 0:
+                        return used_real, limit
+        except Exception:
+            pass
     # cgroup v1 (fallback برای هاست‌های قدیمی‌تر)
     try:
         cur_path = "/sys/fs/cgroup/memory/memory.usage_in_bytes"
         max_path = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
         if os.path.exists(cur_path) and os.path.exists(max_path):
-            with open(cur_path) as f: used = int(f.read().strip())
-            with open(max_path) as f: limit = int(f.read().strip())
-            # اگر limit واقعی ست نشده باشد، یک عدد بسیار بزرگ (تقریباً unlimited) برمی‌گردد
+            used = int(open(cur_path).read().strip())
+            limit = int(open(max_path).read().strip())
+            # اگر limit واقعی ست نشده باشد یک عدد بسیار بزرگ (تقریباً unlimited) برمی‌گردد
             if 0 < limit < 10 ** 14:
                 inactive_file = _read_stat_field("/sys/fs/cgroup/memory/memory.stat", "total_inactive_file")
-                used_real = max(0, used - inactive_file)
-                return used_real, limit
+                return max(0, used - inactive_file), limit
     except Exception:
         pass
     return None
 
+def get_cgroup_cpu():
+    """
+    CPU *واقعی همین کانتینر* را از cgroup می‌خواند و به‌صورت درصدِ سهمِ کانتینر برمی‌گرداند.
+    کد قبلی CPU را از /proc/stat می‌خواند که مصرف کل ماشین میزبان ریلوی (همهٔ کانتینرها) بود
+    و عملاً فیک/ثابت به‌نظر می‌رسید. اینجا usage_usec را از cpu.stat می‌خوانیم و دلتای آن را
+    نسبت به زمانِ سپری‌شده و تعداد هسته‌های اختصاص‌یافته حساب می‌کنیم.
+    خروجی: (cpu_pct, cores) یا None اگر cgroup در دسترس نبود.
+    """
+    global _prev_cpu_usage
+    base = _cgroup_v2_base()
+    if not base:
+        return None
+    stat_path = os.path.join(base, "cpu.stat")
+    if not os.path.exists(stat_path):
+        return None
+    usage = _read_stat_field(stat_path, "usage_usec")  # میکروثانیهٔ تجمعی مصرف CPU
+    if usage <= 0:
+        return None
+    # تعداد هسته‌ها: اول از quota در cpu.max، اگر unlimited بود از cpuset، در نهایت os.cpu_count
+    cores = 0.0
+    try:
+        cm = open(os.path.join(base, "cpu.max")).read().strip().split()
+        if cm and cm[0] != "max":
+            quota = float(cm[0]); period = float(cm[1]) if len(cm) > 1 else 100000.0
+            if period > 0:
+                cores = quota / period           # مثلا 200000/100000 = 2.0 هسته
+    except Exception:
+        pass
+    if cores <= 0:
+        cores = float(_count_cpuset(base)) or float(os.cpu_count() or 1)
+    now = time.time()
+    pct = 0
+    if _prev_cpu_usage is not None:
+        d_usage = usage - _prev_cpu_usage[0]         # میکروثانیهٔ مصرف‌شده در بازه
+        d_wall = now - _prev_cpu_usage[1]            # ثانیهٔ سپری‌شده (دیوار)
+        if d_wall > 0 and cores > 0:
+            pct = (d_usage / (d_wall * 1e6 * cores)) * 100.0
+            pct = max(0, min(100, int(round(pct))))
+    _prev_cpu_usage = (usage, now)
+    cores_disp = int(cores) if abs(cores - round(cores)) < 0.05 else round(cores, 1)
+    return pct, cores_disp
+
 def get_sys_info():
     global prev_cpu
     try:
+        # ── RAM (سهم واقعی کانتینر از cgroup) ──
         cg = get_cgroup_mem()
         if cg:
             used, limit = cg
@@ -214,7 +308,7 @@ def get_sys_info():
             sys_info["ram_used_mb"] = round(used / (1024 ** 2), 1)
             sys_info["ram_limit_mb"] = round(limit / (1024 ** 2), 1)
         else:
-            # fallback: خارج از کانتینر (مثلاً اجرای محلی) — رم کل ماشین را نشان بده
+            # fallback: خارج از کانتینر (اجرای محلی) — رم کل ماشین
             with open('/proc/meminfo', 'r') as f:
                 meminfo = {}
                 for line in f:
@@ -228,23 +322,28 @@ def get_sys_info():
             sys_info["ram_used_mb"] = round((total - available) / 1024, 1) if total else 0
             sys_info["ram_limit_mb"] = round(total / 1024, 1) if total else 0
 
-        with open('/proc/stat', 'r') as f:
-            parts = f.readline().split()[1:]
-            parts = [int(x) for x in parts]
-            idle = parts[3] + (parts[4] if len(parts)>4 else 0)
-            total = sum(parts)
-            if prev_cpu is None: prev_cpu = (idle, total)
-            else:
-                prev_idle, prev_total = prev_cpu
-                delta_idle = idle - prev_idle
-                delta_total = total - prev_total
-                if delta_total > 0: sys_info["cpu"] = max(0, int(100 - (100 * delta_idle / delta_total)))
-                prev_cpu = (idle, total)
+        # ── CPU (سهم واقعی کانتینر از cgroup؛ نه کل ماشین میزبان) ──
+        cc = get_cgroup_cpu()
+        if cc is not None:
+            sys_info["cpu"], sys_info["cpu_cores"] = cc
+        else:
+            # fallback: /proc/stat (فقط وقتی cgroup در دسترس نیست — مثل اجرای محلی خارج کانتینر)
+            with open('/proc/stat', 'r') as f:
+                parts = f.readline().split()[1:]
+                parts = [int(x) for x in parts]
+                idle = parts[3] + (parts[4] if len(parts)>4 else 0)
+                total = sum(parts)
+                if prev_cpu is None: prev_cpu = (idle, total)
+                else:
+                    prev_idle, prev_total = prev_cpu
+                    delta_idle = idle - prev_idle
+                    delta_total = total - prev_total
+                    if delta_total > 0: sys_info["cpu"] = max(0, int(100 - (100 * delta_idle / delta_total)))
+                    prev_cpu = (idle, total)
+            if not sys_info.get("cpu_cores"):
+                sys_info["cpu_cores"] = os.cpu_count() or 1
 
-        # دیسک: مستقیماً از خود فایل‌سیستم کانتینر خوانده می‌شود (نه از API ریلوی).
-        # دلیل: API متریک ریلوی برای این نوع سرویس مقدار EPHEMERAL_DISK_USAGE_GB را اصلاً برنمی‌گرداند
-        # و DISK_USAGE_GB (که مخصوص Volume جداست) همیشه صفر است چون Volume‌ای وصل نیست.
-        # این روش محلی همیشه دقیق و واقعی است و به هیچ توکنی نیاز ندارد.
+        # ── Disk: مستقیماً از خود فایل‌سیستم کانتینر خوانده می‌شود (نه از API ریلوی) ──
         try:
             du = shutil.disk_usage("/")
             sys_info["disk_total_gb"] = round(du.total / (1024 ** 3), 2)
@@ -358,8 +457,87 @@ def get_xray_env():
     env.setdefault("GOGC", "50")
     return env
 
+# ── مدیریت هات کاربر از طریق Xray API (بدون kill/spawn پروسه) ───────────────
+# با adu/rmu کاربر اضافه/حذف می‌شود و هیچ اتصال فعالی قطع نمی‌شود. این جایگزین
+# ری‌استارت کامل Xray می‌شود که قبلاً با هر تغییر کاربر، *همهٔ* کاربران را قطع می‌کرد.
+running_reality_snis = set()  # SNIهای فعال در inbound ریلیتیِ در حال اجرا (برای تشخیص نیاز به sync کامل)
+
+def make_inbound_templates(reality_snis):
+    """قالب inboundها بدون client. مشترک بین sync کامل و افزودن هات کاربر تا از واگرایی تنظیمات جلوگیری شود."""
+    snis = list(reality_snis) if reality_snis else [REALITY_SNI]
+    t = [
+        {"port": XRAY_WS_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "ws-in", "settings": {"clients": [], "decryption": "none"}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/ws"}}},
+        {"port": XRAY_XH_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "xhttp-in", "settings": {"clients": [], "decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}}},
+        {"port": XRAY_GRPC_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "grpc-in", "settings": {"clients": [], "decryption": "none"}, "streamSettings": {"network": "grpc", "grpcSettings": {"serviceName": "grpc"}}},
+        {"port": XRAY_HU_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "hu-in", "settings": {"clients": [], "decryption": "none"}, "streamSettings": {"network": "httpupgrade", "httpupgradeSettings": {"path": "/hu"}}},
+        {"port": XRAY_TJ_PORT, "listen": "127.0.0.1", "protocol": "trojan", "tag": "trojan-in", "settings": {"clients": []}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/tj"}}},
+        {"port": XRAY_VM_PORT, "listen": "127.0.0.1", "protocol": "vmess", "tag": "vmess-in", "settings": {"clients": []}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/vm"}}},
+        {"port": XRAY_XH_INTERNAL_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "xhttp-internal-in", "settings": {"clients": [], "decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}}},
+    ]
+    if reality_keys["priv"]:
+        t.append({
+            "port": REALITY_PORT, "listen": "0.0.0.0", "protocol": "vless", "tag": "reality-in",
+            "settings": {"clients": [], "decryption": "none", "fallbacks": [{"dest": f"127.0.0.1:{XRAY_XH_INTERNAL_PORT}"}]},
+            "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"show": False, "dest": f"{snis[0]}:443", "xver": 0, "serverNames": snis, "privateKey": reality_keys["priv"], "shortIds": ["", "0123456789abcdef"]}}
+        })
+    return t
+
+def _client_for_inbound(inb, uid):
+    """ساخت آبجکت client مناسب هر پروتکل (دقیقاً مطابق نسخهٔ قبلی sync_xray_config)."""
+    proto = inb.get("protocol")
+    if proto == "trojan": return {"password": uid, "email": uid}
+    if proto == "vmess":  return {"id": uid, "level": 0, "email": uid, "alterId": 0}
+    if inb.get("tag") == "reality-in": return {"id": uid, "level": 0, "email": uid, "flow": "xtls-rprx-vision"}
+    return {"id": uid, "level": 0, "email": uid}
+
+def _xray_api(args, timeout=4):
+    """فراخوانی sync به xray api. خروجی: (rc, stdout, stderr)."""
+    try:
+        r = subprocess.run(["/usr/local/bin/xray", "api", args[0], f"--server=127.0.0.1:{XRAY_API_PORT}", *args[1:]],
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except Exception as e:
+        return -1, "", str(e)
+
+def add_user_hot(uid):
+    """افزودن کاربر به همهٔ inboundها بدون ری‌استارت. True اگر موفق."""
+    templates = make_inbound_templates(running_reality_snis)
+    for inb in templates:
+        inb["settings"]["clients"] = [_client_for_inbound(inb, uid)]
+    tmp = f"/tmp/_adu_{uid}.json"
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"inbounds": templates}, f)
+        rc, out, err = _xray_api(["adu", tmp], timeout=5)
+        return rc == 0
+    except Exception:
+        return False
+    finally:
+        try: os.remove(tmp)
+        except Exception: pass
+
+def remove_user_hot(uid):
+    """حذف کاربر از همهٔ inboundها بدون ری‌استارت (idempotent؛ اگر نباشد هم خطا نمی‌دهد)."""
+    for inb in make_inbound_templates(running_reality_snis):
+        _xray_api(["rmu", f"-tag={inb['tag']}", uid], timeout=4)
+    return True
+
+def ensure_user_hot(uid):
+    """تضمین حضور کاربر با تنظیمات تازه (برای edit/extend/reset): اول حذف، بعد افزودن تا adu قطعاً موفق شود."""
+    remove_user_hot(uid)
+    return add_user_hot(uid)
+
+async def add_user_hot_async(uid):
+    return await asyncio.get_running_loop().run_in_executor(None, add_user_hot, uid)
+
+async def remove_user_hot_async(uid):
+    return await asyncio.get_running_loop().run_in_executor(None, remove_user_hot, uid)
+
+async def ensure_user_hot_async(uid):
+    return await asyncio.get_running_loop().run_in_executor(None, ensure_user_hot, uid)
+
 def sync_xray_config():
-    global xray_process
+    global xray_process, running_reality_snis
     generate_reality_keys()
     
     active_links = {}
@@ -380,59 +558,25 @@ def sync_xray_config():
     save_links()
     if not reality_snis: reality_snis.add(REALITY_SNI)
     
-    # \u2500\u2500 \u0633\u0627\u062e\u062a \u0644\u06cc\u0633\u062a \u06a9\u0644\u0627\u06cc\u0646\u062a \u0647\u0631 \u067e\u0631\u0648\u062a\u06a9\u0644 \u0641\u0642\u0637 \u0627\u0632 \u06a9\u0627\u0631\u0628\u0631\u0627\u0646\u06cc \u06a9\u0647 \u0622\u0646 \u06a9\u0627\u0646\u0641\u06cc\u06af \u0628\u0631\u0627\u06cc\u0634\u0627\u0646 \u0645\u062c\u0627\u0632 \u0627\u0633\u062a \u2500\u2500
-    # \u0628\u0627\u06af \u0642\u0628\u0644\u06cc: \u0647\u0645\u0647\u0654 inbound\u200c\u0647\u0627 \u0627\u0632 active_links.keys() \u0627\u0633\u062a\u0641\u0627\u062f\u0647 \u0645\u06cc\u200c\u06a9\u0631\u062f\u0646\u062f\u060c \u067e\u0633 allowed_configs \u0628\u06cc\u200c\u0627\u062b\u0631 \u0628\u0648\u062f
-    # \u0648 \u0647\u0631 \u06a9\u0627\u0631\u0628\u0631 \u0631\u0648\u06cc \u0647\u0645\u0647\u0654 \u067e\u0631\u0648\u062a\u06a9\u0644\u200c\u0647\u0627 \u0633\u0627\u062e\u062a\u0647 \u0645\u06cc\u200c\u0634\u062f. \u062d\u0627\u0644\u0627 \u062a\u06cc\u06a9\u200c\u0647\u0627\u06cc \u0633\u0627\u062e\u062a/\u0648\u06cc\u0631\u0627\u06cc\u0634 \u06a9\u0627\u0631\u0628\u0631 \u0648\u0627\u0642\u0639\u0627\u064b \u0627\u0639\u0645\u0627\u0644 \u0645\u06cc\u200c\u0634\u0648\u0646\u062f.
-    def _user_allows(info, key):
-        ac = info.get("allowed_configs")
-        if not ac:  # \u062e\u0627\u0644\u06cc \u06cc\u0627 \u062a\u0639\u0631\u06cc\u0641\u200c\u0646\u0634\u062f\u0647 = \u0633\u0627\u0632\u06af\u0627\u0631\u06cc \u0628\u0627 \u06af\u0630\u0634\u062a\u0647: \u0647\u0645\u0647 \u0645\u062c\u0627\u0632
-            return True
-        return key in ac
-
-    ws_clients     = [{"id": uid, "level": 0, "email": uid} for uid, info in active_links.items() if _user_allows(info, "ws")]
-    xhttp_clients  = [{"id": uid, "level": 0, "email": uid} for uid, info in active_links.items() if _user_allows(info, "xhttp")]
-    grpc_clients   = [{"id": uid, "level": 0, "email": uid} for uid, info in active_links.items() if _user_allows(info, "grpc")]
-    hu_clients     = [{"id": uid, "level": 0, "email": uid} for uid, info in active_links.items() if _user_allows(info, "hu")]
-    trojan_clients = [{"password": uid, "email": uid} for uid, info in active_links.items() if _user_allows(info, "trojan")]
-    vmess_clients  = [{"id": uid, "level": 0, "email": uid, "alterId": 0} for uid, info in active_links.items() if _user_allows(info, "vmess")]
-    # Reality (vision \u0648 xhttp-over-reality) \u2014 \u06a9\u0627\u0631\u0628\u0631\u0627\u0646\u06cc \u06a9\u0647 \u062d\u062f\u0627\u0642\u0644 \u06cc\u06a9\u06cc \u0627\u0632 reality / xhttp_reality \u0628\u0631\u0627\u06cc\u0634\u0627\u0646 \u0645\u062c\u0627\u0632 \u0627\u0633\u062a
-    _reality_allowed = [uid for uid, info in active_links.items() if (_user_allows(info, "reality") or _user_allows(info, "xhttp_reality"))]
-    reality_clients = [{"id": uid, "level": 0, "email": uid, "flow": "xtls-rprx-vision"} for uid in _reality_allowed]
-    xhttp_reality_clients = [{"id": uid, "level": 0, "email": uid} for uid in _reality_allowed]
-    
-    inbounds = [
-        {"port": XRAY_WS_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "ws-in", "settings": {"clients": ws_clients, "decryption": "none"}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/ws"}}},
-        {"port": XRAY_XH_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "xhttp-in", "settings": {"clients": xhttp_clients, "decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}}},
-        {"port": XRAY_GRPC_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "grpc-in", "settings": {"clients": grpc_clients, "decryption": "none"}, "streamSettings": {"network": "grpc", "grpcSettings": {"serviceName": "grpc"}}},
-        {"port": XRAY_HU_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "hu-in", "settings": {"clients": hu_clients, "decryption": "none"}, "streamSettings": {"network": "httpupgrade", "httpupgradeSettings": {"path": "/hu"}}},
-        {"port": XRAY_TJ_PORT, "listen": "127.0.0.1", "protocol": "trojan", "tag": "trojan-in", "settings": {"clients": trojan_clients}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/tj"}}},
-        {"port": XRAY_VM_PORT, "listen": "127.0.0.1", "protocol": "vmess", "tag": "vmess-in", "settings": {"clients": vmess_clients}, "streamSettings": {"network": "ws", "wsSettings": {"path": "/vm"}}},
-        {"port": XRAY_XH_INTERNAL_PORT, "listen": "127.0.0.1", "protocol": "vless", "tag": "xhttp-internal-in", "settings": {"clients": xhttp_reality_clients, "decryption": "none"}, "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/xh", "mode": "auto"}}}
-    ]
-    
-    if reality_keys["priv"]:
-        inbounds.append({
-            "port": RAILWAY_TCP_APPLICATION_PORT, "listen": "0.0.0.0", "protocol": "vless", "tag": "reality-in",
-            "settings": {"clients": reality_clients, "decryption": "none", "fallbacks": [{"dest": f"127.0.0.1:{XRAY_XH_INTERNAL_PORT}"}]},
-            "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {"show": False, "dest": f"{list(reality_snis)[0]}:443", "xver": 0, "serverNames": list(reality_snis), "privateKey": reality_keys["priv"], "shortIds": ["", "0123456789abcdef"]}}
-        })
+    # ساخت inboundها از قالب مشترک (همان قالبی که افزودن هات کاربر استفاده می‌کند).
+    # running_reality_snis را هم ست می‌کنیم تا create_link بفهمد آیا SNIِ کاربر جدید
+    # در serverNamesِ در حال اجرا هست یا نه (اگر نبود، نیاز به sync کامل دارد).
+    running_reality_snis = set(reality_snis)
+    inbounds = make_inbound_templates(reality_snis)
+    for _inb in inbounds:
+        _inb["settings"]["clients"] = [_client_for_inbound(_inb, _uid) for _uid in active_links.keys()]
     
     cfg = {
         "log": {"loglevel": "warning", "access": XRAY_LOG}, 
         "stats": {},
         "policy": {
             # تنظیمات زیر برای جلوگیری از مصرف بی‌رویه رم وقتی تعداد زیادی کاربر هم‌زمان وصل می‌شوند اضافه شده:
-            # - connIdle پایین‌تر (۶۰ ثانیه به‌جای پیش‌فرض ۳۰۰ ثانیه): اتصالات بی‌کار سریع‌تر بسته می‌شوند
-            #   و رمشان آزاد می‌شود؛ با موبایل که مدام شبکه/وایفای عوض می‌کند خیلی از اتصالات نیمه‌باز
-            #   می‌مانند که با ۵ دقیقه idle timeout قبلی، رم آن‌ها تا مدت‌ها آزاد نمی‌شد.
-            # - bufferSize=64 (کیلوبایت): اندازه بافر داخلی هر اتصال؛ این مقدار دقیقاً همان عددی است که
-            #   پروژه‌های مشابه Xray برای هزاران کاربر هم‌زمان روی سرورهای کم‌رم توصیه و تست کرده‌اند
-            #   (پیش‌فرض اگر ست نشود می‌تواند چند برابر این مقدار رم بگیرد).
-            # bufferSize از 64KB به 32KB کاهش یافت: اصلی‌ترین اهرم کاهش رم زیر بار بالا.
-            # این تغییر هیچ اتصالی را قطع نمی‌کند (فقط اندازه‌ی بافر داخلی relay است) و رم را نصف می‌کند.
-            # connIdle / uplinkOnly / downlinkOnly به مقدار اصلی و تست‌شده برگشتند تا اتصالات سالم قطع نشوند.
+            # connIdle از ۶۰ به ۳۰۰ ثانیه: اتصالات بی‌کار زودهنگام بسته نشوند (علت اصلی «قط‌وصل» بدون
+            #   ری‌استارت در تعداد بالا). مصرف رم حالا با GOMEMLIMIT/cgroup کنترل می‌شود، پس این تریدآف ارزشش را دارد.
+            # handshake از ۴ به ۸ ثانیه: زیر بار CPU بالا، هندشیک TLS گاهی >۴ ثانیه می‌شد و اتصال شکست می‌خورد
+            #   (کاربر دوباره وصل می‌شد = قط‌وصل). ۸ ثانیه فضای کافی می‌دهد.
             "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True,
-                              "handshake": 4, "connIdle": 60, "uplinkOnly": 2, "downlinkOnly": 4,
+                              "handshake": 8, "connIdle": 300, "uplinkOnly": 2, "downlinkOnly": 4,
                               "bufferSize": 32}},
             "system": {"statsInboundUplink": True, "statsInboundDownlink": True}
         },
@@ -506,6 +650,32 @@ async def _read_log_segment_async(path, pos, max_size):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _read_log_segment_sync, path, pos, max_size)
 
+# شمارندهٔ ذخیرهٔ دوره‌ای آمار (لیست تک‌عضوی تا داخل کوروتین بدون global قابل تغییر باشد)
+stats_save_counter = [0]
+LOG_CAP_BYTES = 5 * 1024 * 1024  # سقف اندازهٔ هر فایل لاگ قبل از چرخش
+
+def _rotate_logs_sync():
+    """اگر فایل‌های لاگ از سقف رد شدند، کوتاه‌شان کن و به writer بگو فایل را دوباره باز کند.
+    Xray با restartlogger و Nginx با `nginx -s reopen` فایل را تازه باز می‌کنند تا فایل sparse نشود."""
+    global xray_log_pos, nginx_log_pos
+    try:
+        if os.path.exists(XRAY_LOG) and os.path.getsize(XRAY_LOG) > LOG_CAP_BYTES:
+            open(XRAY_LOG, "w").close()
+            _xray_api(["restartlogger"], timeout=3)
+            xray_log_pos = 0
+    except Exception:
+        pass
+    try:
+        if os.path.exists(NGINX_LOG) and os.path.getsize(NGINX_LOG) > LOG_CAP_BYTES:
+            open(NGINX_LOG, "w").close()
+            subprocess.run(["nginx", "-s", "reopen"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            nginx_log_pos = 0
+    except Exception:
+        pass
+
+async def rotate_logs_if_big():
+    await asyncio.get_running_loop().run_in_executor(None, _rotate_logs_sync)
+
 async def stats_updater():
     global xray_log_pos, nginx_log_pos
     await asyncio.sleep(5)
@@ -539,9 +709,12 @@ async def stats_updater():
                     parts = name.split(">>>")
                     if len(parts) == 4 and parts[0] == "user" and parts[2] == "traffic":
                         uid = parts[1]
+                        direction = parts[3]  # "uplink" یا "downlink" — برای محاسبهٔ سرعت واقعی مجزا
                         if uid not in user_traffic: user_traffic[uid] = 0
                         user_traffic[uid] += value
                         stats["bytes"] += value
+                        if direction == "downlink": stats["down_bytes"] += value
+                        elif direction == "uplink": stats["up_bytes"] += value
                         if value > 0:
                             user_last_active[uid] = time.time()
                             # اگر mapping پروتکل این کاربر رو قبلاً از لاگ Xray یاد گرفتیم،
@@ -556,7 +729,7 @@ async def stats_updater():
                         # کاربر را نشان می‌دهد یا نه، دقیقاً می‌فهمیم همین الان از کدام پروتکل ترافیک رد شده.
                         tag = parts[1]
                         if value > 0: inbound_last_active[tag] = time.time()
-            await save_stats_async()
+            # ذخیره‌سازی دیگر اینجا (هر چرخه) انجام نمی‌شود؛ به‌صورت دوره‌ای در انتهای حلقه ذخیره می‌شود.
         except: pass
 
         # ۲. خواندن ترافیک از لاگ Nginx (و تشخیص ایپی واقعی فعال هر پروتکل: ws/xhttp/grpc/hu/trojan/vmess)
@@ -572,20 +745,13 @@ async def stats_updater():
                     if len(fields) < 3: continue
                     remote_addr, xff, b_str = fields[0], fields[1], fields[2]
                     proto = fields[3] if len(fields) >= 4 else None
-                    try: b = int(b_str)
-                    except ValueError: b = 0
-                    if b > 0: stats["bytes"] += b
-
-                    # ✅ اصلاح شمارش آنلاین: روی پلتفرم‌هایی مثل Railway، آی‌پی واقعی کاربر همیشه
-                    # اولین آی‌پی در X-Forwarded-For است؛ $remote_addr فقط آی‌پی پراکسی داخلی پلتفرم
-                    # است که می‌تواند بین چند سرور edge بچرخد و یک کاربر را به‌اشتباه چند «اتصال» نشان دهد.
-                    # پس اول XFF (آی‌پی واقعی کاربر) را می‌خوانیم تا دقیقاً «آی‌پی‌های فعال یکتا» شمرده شوند،
-                    # و فقط در نبودِ XFF به remote_addr عمومی برمی‌گردیم (حالت اجرای مستقیم بدون پراکسی جلویی).
-                    real_ip = ""
-                    if xff:
+                    # نکته: دیگر بایت‌های Nginx را به stats["bytes"] اضافه نمی‌کنیم. ترافیک WS/XHTTP/... هم از
+                    # Nginx و هم از Xray رد می‌شود؛ شمارش هر دو باعث دو‌برابر‌شدن حجم و سرعت اشتباه می‌شد.
+                    # حالا منبع واحد و دقیق، شمارندهٔ خود Xray است. لاگ Nginx فقط برای تشخیص IP واقعی استفاده می‌شود.
+                    real_ip = remote_addr if is_public_ip(remote_addr) else ""
+                    if not real_ip and xff:
                         first_ip = xff.split(",")[0].strip()
                         if is_public_ip(first_ip): real_ip = first_ip
-                    if not real_ip and is_public_ip(remote_addr): real_ip = remote_addr
                     if not real_ip: continue
 
                     if len(total_unique_ips) < 2000: total_unique_ips.add(real_ip)
@@ -609,24 +775,29 @@ async def stats_updater():
                     proto = TAG_TO_PROTO.get(tag)
                     if not proto: continue
 
-                    # فقط تشخیص آنلاین‌بودن: کدام کاربر به کدام پروتکل وصل است.
-                    # شمارش آی‌پی Reality حذف شد (روی Railway آی‌پی واقعی در دسترس نیست و فقط بار بی‌مورد ایجاد می‌کرد).
+                    # ردیابی دقیق: کدام کاربر به کدام پروتکل وصل است
                     if uid not in user_protocol_active:
                         user_protocol_active[uid] = {}
                     user_protocol_active[uid][proto] = now_t
                     user_last_active[uid] = now_t
 
-                    # ✅ شمارش آی‌پی فعال Reality: برخلاف WS/gRPC/... که از Nginx رد می‌شوند و آی‌پیِ Xray برایشان 127.0.0.1 است،
-                    # اتصال Reality مستقیم به خود Xray می‌رسد؛ پس آی‌پی منبعِ همین لاگ Xray را می‌شماریم.
-                    # هر آی‌پی (به‌جز لوکال‌هاست) را نگه می‌داریم — روی VPS آی‌پی واقعی کاربر و روی Railway آی‌پیِ دیده‌شده شمرده می‌شود.
-                    if proto == "reality" and ip not in ("127.0.0.1", "::1", ""):
-                        protocol_connections.setdefault("reality", {})[ip] = now_t
+                    # فقط برای Reality: ایپی واقعی کاربر را هم ذخیره کن
+                    if tag == "reality-in" and is_public_ip(ip):
+                        if uid not in active_connections:
+                            active_connections[uid] = {}
+                        active_connections[uid][ip] = now_t
+                        if len(total_unique_ips) < 2000:
+                            total_unique_ips.add(ip)
         except: pass
 
         # ۴. پاکسازی حافظه
         now = time.time()
         for uid in list(user_last_active.keys()):
             if now - user_last_active[uid] > 60: del user_last_active[uid]
+        for uid in list(active_connections.keys()):
+            for ip in list(active_connections[uid].keys()):
+                if now - active_connections[uid][ip] > 60: del active_connections[uid][ip]
+            if not active_connections[uid]: del active_connections[uid]
         for proto in list(protocol_connections.keys()):
             for ip in list(protocol_connections[proto].keys()):
                 if now - protocol_connections[proto][ip] > 60: del protocol_connections[proto][ip]
@@ -643,30 +814,48 @@ async def stats_updater():
         for t in list(SESSIONS.keys()):
             if now > SESSIONS.get(t, 0): del SESSIONS[t]
 
-        # ۵. محاسبه سرعت دانلود/آپلود
+        # ۵. محاسبهٔ سرعت واقعی دانلود/آپلود (مجزا، از شمارندهٔ خود Xray — نه تخمین ساختگی ۶۵/۳۵)
         now_t2 = time.time()
         elapsed = now_t2 - stats["bytes_prev_time"]
         if elapsed > 0:
-            delta = stats["bytes"] - stats["bytes_prev"]
-            speed = delta / elapsed  # bytes per second
-            # نصف ترافیک تخمینی دانلود، نصف آپلود
-            stats["dl_speed"] = int(speed * 0.65)
-            stats["ul_speed"] = int(speed * 0.35)
+            stats["dl_speed"] = int(max(0, stats["down_bytes"] - stats["down_prev"]) / elapsed)
+            stats["ul_speed"] = int(max(0, stats["up_bytes"] - stats["up_prev"]) / elapsed)
+            stats["down_prev"] = stats["down_bytes"]
+            stats["up_prev"] = stats["up_bytes"]
             stats["bytes_prev"] = stats["bytes"]
             stats["bytes_prev_time"] = now_t2
 
-        # ۶. بررسی محدودیت دستگاه و انقضا
-        needs_restart = False
-        for uid, info in LINKS.items():
+        # ۶. بررسی محدودیت دستگاه و انقضا — بدون ری‌استارت کامل!
+        # قبلاً هر تخطی (انقضا/سقف حجم/سقف IP) کل Xray را ری‌استارت می‌کرد و *همهٔ* کاربران قطع می‌شدند.
+        # حالا فقط همان کاربر متخلف با rmu به‌صورت هات حذف می‌شود و بقیه دست‌نخورده می‌مانند.
+        to_disable = []
+        for uid, info in list(LINKS.items()):
             if info.get("status") != "active": continue
             ip_limit = int(info.get("ip_limit", 0) or 0)
-            if info.get("expiry_time") and time.time() > info["expiry_time"]: needs_restart = True
-            if info.get("data_limit") and user_traffic.get(uid, 0) >= info["data_limit"]: needs_restart = True
-            
-        if needs_restart: await sync_xray_config_async()
-            
-        # افزایش زمان خواب از ۵ ثانیه به ۱۵ ثانیه برای کاهش فشار CPU
-        await asyncio.sleep(15)
+            if ip_limit > 0:
+                real_ips = [ip for ip in active_connections.get(uid, {}) if ip != "local"]
+                if len(real_ips) > ip_limit:
+                    info["status"] = "blocked"; to_disable.append(uid); continue
+            if info.get("expiry_time") and time.time() > info["expiry_time"]:
+                info["status"] = "expired"; to_disable.append(uid); continue
+            if info.get("data_limit") and user_traffic.get(uid, 0) >= info["data_limit"]:
+                info["status"] = "expired"; to_disable.append(uid); continue
+        if to_disable:
+            save_links()
+            for uid in to_disable:
+                await remove_user_hot_async(uid)
+
+        # ۷. چرخش امن لاگ‌ها (با حذف ری‌استارت‌ها دیگر خودبه‌خود پاک نمی‌شوند → باید از پر شدن /tmp جلوگیری کنیم)
+        await rotate_logs_if_big()
+
+        # ۸. ذخیرهٔ دوره‌ای آمار (هر ~۳۰ ثانیه به‌جای هر چرخه، برای کاهش I/O دیسک)
+        stats_save_counter[0] += 1
+        if stats_save_counter[0] >= 6:
+            stats_save_counter[0] = 0
+            await save_stats_async()
+
+        # خواب ۵ ثانیه (به‌جای ۱۵): سرعت ۳ برابر سریع‌تر آپدیت می‌شود و آنلاین‌بودن کاربران زودتر تشخیص داده می‌شود.
+        await asyncio.sleep(5)
 
 # ── متریک‌های واقعی ریلوی (رم/ترافیک/دیسک) ──────────────────
 # نکته مهم: ریلوی یک API عمومی رسمی برای این متریک‌ها منتشر نکرده؛ اینجا همان کوئری گرافیک‌کیوال
@@ -823,11 +1012,11 @@ def make_links(uid: str, domain: str, label: str, sni: str, short_id: str, clean
     
     user_sni = sni or REALITY_SNI
     user_pbk = reality_keys["pub"]
-    reality = "خطا: RAILWAY_TCP_PROXY_DOMAIN ست نشده"
-    xhttp_reality = "خطا: RAILWAY_TCP_PROXY_DOMAIN ست نشده"
-    if RAILWAY_TCP_PROXY_DOMAIN and user_pbk:
-        reality = f"vless://{uid}@{RAILWAY_TCP_PROXY_DOMAIN}:{RAILWAY_TCP_PROXY_PORT}?encryption=none&security=reality&sni={user_sni}&fp=chrome&pbk={user_pbk}&sid=0123456789abcdef&type=tcp&flow=xtls-rprx-vision#{label}-Reality"
-        xhttp_reality = f"vless://{uid}@{RAILWAY_TCP_PROXY_DOMAIN}:{RAILWAY_TCP_PROXY_PORT}?encryption=none&security=reality&sni={user_sni}&fp=chrome&pbk={user_pbk}&sid=0123456789abcdef&type=xhttp&path=%2Fxh&mode=auto#{label}-XHTTP-Reality"
+    reality = "خطا: REALITY_DOMAIN ست نشده"
+    xhttp_reality = "خطا: REALITY_DOMAIN ست نشده"
+    if REALITY_DOMAIN and user_pbk:
+        reality = f"vless://{uid}@{REALITY_DOMAIN}:{REALITY_PUBLIC_PORT}?encryption=none&security=reality&sni={user_sni}&fp=chrome&pbk={user_pbk}&sid=0123456789abcdef&type=tcp&flow=xtls-rprx-vision#{label}-Reality"
+        xhttp_reality = f"vless://{uid}@{REALITY_DOMAIN}:{REALITY_PUBLIC_PORT}?encryption=none&security=reality&sni={user_sni}&fp=chrome&pbk={user_pbk}&sid=0123456789abcdef&type=xhttp&path=%2Fxh&mode=auto#{label}-XHTTP-Reality"
 
     # نقشه پروتکل -> لینک
     proto_link_map = {"ws": ws, "xhttp": xhttp, "grpc": grpc, "hu": httpupgrade, "trojan": trojan, "vmess": vmess, "reality": reality, "xhttp_reality": xhttp_reality}
@@ -894,13 +1083,19 @@ def build_active_configs():
         if not users: continue
         config_label = PROTOCOL_LABELS.get(proto, proto)
 
-        # شمارش آی‌پی فعال برای همه پروتکل‌ها (شامل Reality که ایپی‌اش از لاگ Xray می‌آید).
-        ip_count = len(protocol_connections.get(proto, {})) or len(users)
-        if len(users) == 1:
-            items.append({"config": config_label, "label": users[0]["label"], "ip_count": ip_count, "attributed": True})
+        if proto == "reality":
+            for user in users:
+                uid = user["uid"]
+                ips = active_connections.get(uid, {})
+                ip_count = len(ips) if ips else 1
+                items.append({"config": config_label, "label": user["label"], "ip_count": ip_count, "attributed": True})
         else:
-            labels = [u["label"] for u in users[:5]]
-            items.append({"config": config_label, "label": " / ".join(labels), "ip_count": ip_count, "attributed": False})
+            ip_count = len(protocol_connections.get(proto, {})) or len(users)
+            if len(users) == 1:
+                items.append({"config": config_label, "label": users[0]["label"], "ip_count": ip_count, "attributed": True})
+            else:
+                labels = [u["label"] for u in users[:5]]
+                items.append({"config": config_label, "label": " / ".join(labels), "ip_count": ip_count, "attributed": False})
 
     # ──── مرحله ۲: fallback برای کاربران بدون mapping ────
     # کاربرانی که آنلاین هستند (Stats API) ولی هنوز خط accepted لاگ Xray برایشان ثبت نشده
@@ -923,9 +1118,7 @@ def format_active_configs_text(items):
     if not items: return "هیچ کانفیگ آنلاینی وجود ندارد."
     lines = []
     for it in items:
-        if it.get("reality_no_ip"):
-            lines.append(f"\U0001f50c \u06a9\u0627\u0646\u0641\u06cc\u06af {it['config']} \u06a9\u0627\u0631\u0628\u0631 {it['label']} \u0622\u0646\u0644\u0627\u06cc\u0646 (\u067e\u0634\u062a \u067e\u0631\u0648\u06a9\u0633\u06cc \u067e\u0644\u062a\u0641\u0631\u0645 \u2014 \u0634\u0645\u0627\u0631\u0634 IP \u062f\u0631 \u062f\u0633\u062a\u0631\u0633 \u0646\u06cc\u0633\u062a)")
-        elif it["attributed"]:
+        if it["attributed"]:
             lines.append(f"🔌 کانفیگ {it['config']} کاربر {it['label']} آنلاین با {it['ip_count']} ایپی فعال که بهش وصلن")
         else:
             lines.append(f"🔌 کانفیگ {it['config']} — کاربران ({it['label']}) آنلاین، مجموعاً {it['ip_count']} ایپی فعال متصل")
@@ -963,6 +1156,7 @@ async def api_stats(request: Request, token: Optional[str] = Cookie(None)):
         "ram_used_mb": sys_info.get("ram_used_mb", 0),
         "ram_limit_mb": sys_info.get("ram_limit_mb", 0),
         "cpu": sys_info["cpu"],
+        "cpu_cores": sys_info.get("cpu_cores", 0),
         "active_configs": active_configs,
         "railway_available": railway_metrics["available"],
         "railway_ram_pct": railway_metrics["ram_pct"],
@@ -1144,7 +1338,7 @@ async def api_links(request: Request, token: Optional[str] = Cookie(None)):
     if not auth_check(token): raise HTTPException(401)
     domain = get_domain(request); out = []
     for uid, info in LINKS.items():
-        conn_count = 1 if uid in user_last_active else 0
+        conn_count = len(active_connections.get(uid, {}))
         data_limit = info.get("data_limit", 0)
         used_traffic = user_traffic.get(uid, 0)
         remaining_data = (data_limit - used_traffic) if data_limit else 0
@@ -1184,7 +1378,13 @@ async def create_link(request: Request, token: Optional[str] = Cookie(None)):
     if gb > 0: info["data_limit"] = int(gb * 1024 * 1024 * 1024)
     
     LINKS[uid] = info
-    save_links(); await sync_xray_config_async(); domain = get_domain(request)
+    save_links()
+    # افزودن هات بدون ری‌استارت؛ فقط اگر SNIِ ریلیتیِ کاربر در serverNamesِ فعلی نباشد sync کامل لازم است (نادر).
+    if reality_keys["priv"] and sni and sni not in running_reality_snis:
+        await sync_xray_config_async()
+    elif not await add_user_hot_async(uid):
+        await sync_xray_config_async()  # fallback ایمن اگر افزودن هات شکست خورد
+    domain = get_domain(request)
     return {"ok": True, "uuid": uid, **make_links(uid, domain, label, sni, short_id, clean_ip)}
 
 @app.post("/api/links/{uid}/edit")
@@ -1208,7 +1408,11 @@ async def edit_link(uid: str, request: Request, token: Optional[str] = Cookie(No
     else: LINKS[uid].pop("data_limit", None)
         
     LINKS[uid]["status"] = "active"
-    save_links(); await sync_xray_config_async(); return {"ok": True}
+    save_links()
+    # allowed_configs روی inboundهای Xray اثر ندارد (فیلتر فقط در لینک ساب است). فقط حضور کاربر را تضمین می‌کنیم.
+    if not await ensure_user_hot_async(uid):
+        await sync_xray_config_async()
+    return {"ok": True}
 
 @app.post("/api/links/{uid}/extend")
 async def extend_link(uid: str, token: Optional[str] = Cookie(None)):
@@ -1217,7 +1421,10 @@ async def extend_link(uid: str, token: Optional[str] = Cookie(None)):
     if "expiry_time" in LINKS[uid] and LINKS[uid]["expiry_time"] > time.time(): LINKS[uid]["expiry_time"] += 30 * 86400
     else: LINKS[uid]["expiry_time"] = time.time() + 30 * 86400
     LINKS[uid]["status"] = "active"
-    save_links(); await sync_xray_config_async(); return {"ok": True}
+    save_links()
+    if not await ensure_user_hot_async(uid):
+        await sync_xray_config_async()
+    return {"ok": True}
 
 @app.post("/api/links/{uid}/reset")
 async def reset_traffic(uid: str, token: Optional[str] = Cookie(None)):
@@ -1225,7 +1432,10 @@ async def reset_traffic(uid: str, token: Optional[str] = Cookie(None)):
     if uid not in LINKS: raise HTTPException(404)
     user_traffic[uid] = 0
     LINKS[uid]["status"] = "active"
-    await save_stats_async(); save_links(); await sync_xray_config_async(); return {"ok": True}
+    await save_stats_async(); save_links()
+    if not await ensure_user_hot_async(uid):
+        await sync_xray_config_async()
+    return {"ok": True}
 
 @app.post("/api/cleanup")
 async def cleanup_users(token: Optional[str] = Cookie(None)):
@@ -1238,7 +1448,7 @@ async def cleanup_users(token: Optional[str] = Cookie(None)):
 async def delete_link(uid: str, token: Optional[str] = Cookie(None)):
     if not auth_check(token): raise HTTPException(401)
     if uid == MASTER_UUID: raise HTTPException(403, "کاربر اصلی قابل حذف نیست")
-    LINKS.pop(uid, None); save_links(); await sync_xray_config_async(); return {"ok": True}
+    LINKS.pop(uid, None); save_links(); await remove_user_hot_async(uid); return {"ok": True}
 
 @app.post("/api/change-password")
 async def change_pass(request: Request, token: Optional[str] = Cookie(None)):
@@ -1366,7 +1576,7 @@ PANEL_HTML = r"""<!DOCTYPE html><html lang="fa" dir="rtl"><head><meta charset="U
     <div class="stat-card speed-dl"><div class="stat-icon">⬇️</div><div class="stat-val" id="s-dl">—</div><div class="stat-label">سرعت دانلود</div></div>
     <div class="stat-card speed-ul"><div class="stat-icon">⬆️</div><div class="stat-val" id="s-ul">—</div><div class="stat-label">سرعت آپلود</div></div>
     <div class="stat-card"><div class="stat-icon">🧠</div><div class="stat-val" id="s-ram">—</div><div class="stat-label">رم مصرفی کانتینر (%)</div><div id="s-ram-detail" style="font-size:11px;color:var(--muted);margin-top:2px">—</div></div>
-    <div class="stat-card"><div class="stat-icon">⚙️</div><div class="stat-val" id="s-cpu">—</div><div class="stat-label">پردازنده (%)</div></div>
+    <div class="stat-card"><div class="stat-icon">⚙️</div><div class="stat-val" id="s-cpu">—</div><div class="stat-label">پردازنده (%)</div><div id="s-cpu-detail" style="font-size:11px;color:var(--muted);margin-top:2px">—</div></div>
     <div class="stat-card"><div class="stat-icon">🧠</div><div class="stat-val" id="s-railway-ram">—</div><div class="stat-label">رم ریلوی (%)</div></div>
     <div class="stat-card"><div class="stat-icon">💾</div><div class="stat-val" id="s-railway-disk">—</div><div class="stat-label">دیسک کانتینر</div></div>
   </div>
@@ -1405,6 +1615,7 @@ document.getElementById('s-ul').textContent=fmtSpeed(d.ul_speed);
 document.getElementById('s-ram').textContent=d.ram+'%';
 document.getElementById('s-ram-detail').textContent=d.ram_used_mb+' / '+d.ram_limit_mb+' MB';
 document.getElementById('s-cpu').textContent=d.cpu+'%';
+if(d.cpu_cores){document.getElementById('s-cpu-detail').textContent=d.cpu_cores+' هسته';}
 document.getElementById('s-total-combined').textContent=fmtBytes(d.combined_bytes);
 document.getElementById('s-railway-disk').textContent=d.disk_used_gb+' / '+d.disk_total_gb+' GB ('+d.disk_pct+'%)';
 if(d.railway_available){
@@ -1421,7 +1632,7 @@ var totalConn=d.active_ips||0;
 document.getElementById('reality-total-badge').textContent=totalConn+' ایپی فعال';
 var rc=document.getElementById('reality-connections');
 if(configs.length===0){rc.innerHTML='<div style="color:var(--muted);font-size:13px;text-align:center;padding:20px">هیچ کانفیگ آنلاینی وجود ندارد</div>';}
-else{var html='';configs.forEach(function(it){var icon=it.attributed?'🔥':'🌐';var cnt=it.reality_no_ip?'آنلاین':(it.ip_count+' ایپی فعال');var sub=it.reality_no_ip?('کاربر '+it.label+' آنلاین — شمارش IP پشت پروکسی پلتفرم در دسترس نیست'):(it.attributed?('کاربر '+it.label+' آنلاین'):('کاربران آنلاین: '+it.label));html+='<div class="reality-user-row">';html+='<div class="reality-user-name">'+icon+' '+it.config+' <span class="reality-conn-count">'+cnt+'</span></div>';html+='<div class="reality-ip-list"><span class="reality-ip-tag" style="direction:rtl">'+sub+'</span></div></div>';});rc.innerHTML=html;}
+else{var html='';configs.forEach(function(it){var icon=it.attributed?'🔥':'🌐';var sub=it.attributed?('کاربر '+it.label+' آنلاین'):('کاربران آنلاین: '+it.label);html+='<div class="reality-user-row">';html+='<div class="reality-user-name">'+icon+' '+it.config+' <span class="reality-conn-count">'+it.ip_count+' ایپی فعال</span></div>';html+='<div class="reality-ip-list"><span class="reality-ip-tag" style="direction:rtl">'+sub+'</span></div></div>';});rc.innerHTML=html;}
 }catch(e){}}
 function fmtBytes(b){if(b<1024)return b+'B';if(b<1024*1024)return(b/1024).toFixed(1)+'KB';if(b<1024**3)return(b/1024/1024).toFixed(2)+'MB';return(b/1024**3).toFixed(2)+'GB';}
 async function loadUsers(){try{const r=await fetch('/api/links',{credentials:'include'});if(r.status===401){location.href='__LOGIN_URL__';return}const d=await r.json();const tb=document.getElementById('users-tbody');if(!d.links.length){tb.innerHTML='<tr><td colspan="6" style="text-align:center;padding:24px">کاربری وجود ندارد</td></tr>';return;}allUsers={};tb.innerHTML=d.links.map(function(u){allUsers[u.uuid]=u;let status_badge='<span class="badge badge-blue">🟢 '+(u.online_ips>0?(u.online_ips+' اتصال'):'آنلاین')+'</span>';if(u.status==='expired')status_badge='<span class="badge badge-red">منقضی</span>';if(u.status==='blocked')status_badge='<span class="badge badge-yellow">مسدود شده</span>';let limits='';if(u.data_limit>0)limits+='<span class="badge badge-yellow">باقی‌مانده: '+fmtBytes(u.remaining_data)+'</span><br>';if(u.remaining_days>0)limits+='<span class="badge badge-yellow">'+u.remaining_days+' روز</span>';if(u.ip_limit>0)limits+='<span class="badge badge-yellow">سقف دستگاه: '+u.ip_limit+'</span>';return '<tr><td><span class="badge badge-green">'+u.label+'</span><br>'+limits+'</td><td><span style="font-size: 10px">'+u.uuid.substring(0,8)+'…</span></td><td>'+u.created_at+'</td><td>'+fmtBytes(u.used_traffic)+'</td><td>'+status_badge+'</td><td><button class="btn-sm" onclick="showLinks(\''+u.uuid+'\')">🔗 لینک</button><button class="btn-sm" onclick="extendUser(\''+u.uuid+'\')">➕ ۳۰ روز</button><button class="btn-sm" onclick="editUser(\''+u.uuid+'\')">✏️ ویرایش</button><button class="btn-sm" onclick="delUser(\''+u.uuid+'\')">حذف</button></td></tr>';}).join('');}catch(e){}}
@@ -1564,7 +1775,8 @@ async def bot_webhook(req: Request):
 
                 LINKS[uid] = info
                 save_links()
-                await sync_xray_config_async()
+                if not await add_user_hot_async(uid):
+                    await sync_xray_config_async()
 
                 domain = PUBLIC_HOST or "your-domain.com"
                 sub_link = f"https://{domain}/sub/{short_id}"
@@ -1594,232 +1806,8 @@ async def panel_page(token: Optional[str] = Cookie(None)):
     html = PANEL_HTML.replace("__LOGIN_URL__", "/" + ADMIN_PATH + "/login")
     return HTMLResponse(html)
 
-LANDING_HTML = r'''<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ZodProxy | کانفیگ‌های پرسرعت و رایگان V2Ray</title>
-<meta name="description" content="ZodProxy؛ کانال تخصصی پروکسی و کانفیگ‌های پرسرعت و رایگان V2Ray، VLESS، Reality، Trojan و Shadowsocks. آپدیت روزانه، اتصال پایدار و دور زدن فیلترینگ.">
-<meta name="theme-color" content="#0f1020">
-<meta property="og:title" content="ZodProxy | کانفیگ‌های پرسرعت و رایگان">
-<meta property="og:description" content="کانفیگ‌های پرسرعت V2Ray، Reality و Trojan — رایگان و با آپدیت روزانه.">
-<meta property="og:type" content="website">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;700;800&display=swap" rel="stylesheet">
-<style>
-:root{
-  --bg:#0a0a16;--bg2:#10122a;--card:rgba(255,255,255,.045);--border:rgba(255,255,255,.09);
-  --txt:#eef0ff;--muted:#9aa0c7;--accent:#7c5cff;--accent2:#22d3ee;--green:#34d399;
-  --grad:linear-gradient(135deg,#7c5cff,#22d3ee);
-}
-*{box-sizing:border-box;margin:0;padding:0}
-html{scroll-behavior:smooth}
-body{
-  font-family:'Vazirmatn',system-ui,'Segoe UI',sans-serif;background:var(--bg);color:var(--txt);
-  line-height:1.85;overflow-x:hidden;-webkit-font-smoothing:antialiased;position:relative;
-}
-/* پس‌زمینه‌ی نوری ثابت (CSS خالص، بدون JS و بدون بار روی سرور) */
-body::before,body::after{content:"";position:fixed;border-radius:50%;filter:blur(90px);opacity:.40;z-index:-1;pointer-events:none}
-body::before{width:520px;height:520px;background:#7c5cff;top:-160px;right:-120px}
-body::after{width:480px;height:480px;background:#22d3ee;bottom:-180px;left:-140px}
-a{text-decoration:none;color:inherit}
-.wrap{max-width:1080px;margin:0 auto;padding:0 22px}
-/* NAV */
-nav{position:sticky;top:0;z-index:50;backdrop-filter:blur(14px);background:rgba(10,10,22,.65);border-bottom:1px solid var(--border)}
-.nav-in{display:flex;align-items:center;justify-content:space-between;height:64px}
-.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:19px}
-.logo{width:38px;height:38px;border-radius:11px;background:var(--grad);display:grid;place-items:center;font-size:20px;box-shadow:0 6px 20px rgba(124,92,255,.45)}
-.nav-cta{background:var(--grad);color:#fff;padding:9px 18px;border-radius:11px;font-weight:700;font-size:14px;transition:.2s;white-space:nowrap}
-.nav-cta:hover{transform:translateY(-2px);box-shadow:0 10px 26px rgba(124,92,255,.4)}
-/* HERO */
-.hero{text-align:center;padding:78px 0 54px}
-.pill{display:inline-flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);padding:7px 16px;border-radius:100px;font-size:13px;color:var(--muted);margin-bottom:26px}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green);animation:pulse 1.8s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-.hero h1{font-size:clamp(33px,6vw,60px);font-weight:800;line-height:1.25;letter-spacing:-.5px}
-.grad-txt{background:var(--grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-.hero p{max-width:620px;margin:22px auto 0;color:var(--muted);font-size:clamp(15px,2.5vw,18px)}
-.btns{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-top:38px}
-.btn{display:inline-flex;align-items:center;gap:9px;padding:15px 30px;border-radius:14px;font-weight:700;font-size:16px;transition:.2s}
-.btn-main{background:var(--grad);color:#fff;box-shadow:0 12px 32px rgba(124,92,255,.42)}
-.btn-main:hover{transform:translateY(-3px);box-shadow:0 18px 40px rgba(124,92,255,.55)}
-.btn-ghost{background:var(--card);border:1px solid var(--border);color:var(--txt)}
-.btn-ghost:hover{border-color:var(--accent);transform:translateY(-3px)}
-/* STATS */
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin:18px 0 10px}
-.stat{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:24px 14px;text-align:center}
-.stat b{display:block;font-size:clamp(24px,5vw,34px);font-weight:800;background:var(--grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-.stat span{font-size:13px;color:var(--muted)}
-/* SECTION */
-section{padding:60px 0}
-.sec-head{text-align:center;max-width:620px;margin:0 auto 46px}
-.sec-head h2{font-size:clamp(26px,4.5vw,40px);font-weight:800}
-.sec-head p{color:var(--muted);margin-top:12px;font-size:16px}
-/* FEATURES */
-.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:28px 24px;transition:.25s}
-.card:hover{transform:translateY(-5px);border-color:rgba(124,92,255,.5);background:rgba(124,92,255,.06)}
-.ico{width:54px;height:54px;border-radius:14px;display:grid;place-items:center;font-size:26px;background:rgba(124,92,255,.14);border:1px solid rgba(124,92,255,.25);margin-bottom:18px}
-.card h3{font-size:19px;font-weight:700;margin-bottom:8px}
-.card p{color:var(--muted);font-size:14.5px}
-/* PROTOCOLS */
-.chips{display:flex;flex-wrap:wrap;gap:12px;justify-content:center}
-.chip{background:var(--card);border:1px solid var(--border);padding:11px 22px;border-radius:12px;font-weight:600;font-size:15px;transition:.2s}
-.chip:hover{border-color:var(--accent2);color:var(--accent2)}
-/* STEPS */
-.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
-.step{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:30px 24px;position:relative;overflow:hidden}
-.step-n{font-size:54px;font-weight:800;line-height:1;background:var(--grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;opacity:.85}
-.step h3{font-size:18px;font-weight:700;margin:14px 0 8px}
-.step p{color:var(--muted);font-size:14.5px}
-/* APPS */
-.apps{display:flex;flex-wrap:wrap;gap:10px;justify-content:center}
-.app{background:var(--card);border:1px solid var(--border);padding:10px 18px;border-radius:100px;font-size:14px;color:var(--muted)}
-/* CTA */
-.cta{background:linear-gradient(135deg,rgba(124,92,255,.16),rgba(34,211,238,.10));border:1px solid rgba(124,92,255,.3);border-radius:26px;padding:56px 30px;text-align:center}
-.cta h2{font-size:clamp(26px,4.5vw,40px);font-weight:800}
-.cta p{color:var(--muted);margin:14px auto 30px;max-width:520px}
-/* FOOTER */
-footer{border-top:1px solid var(--border);padding:34px 0;text-align:center;color:var(--muted);font-size:14px}
-footer .brand{justify-content:center;margin-bottom:14px;font-size:17px}
-footer a.tg{color:var(--accent2);font-weight:700}
-@media(max-width:760px){
-  .grid,.steps{grid-template-columns:1fr}
-  .stats{grid-template-columns:repeat(2,1fr)}
-  .hero{padding:54px 0 36px}
-  section{padding:46px 0}
-}
-</style>
-</head>
-<body>
-
-<nav>
-  <div class="wrap nav-in">
-    <div class="brand"><span class="logo">⚡</span><span>ZodProxy</span></div>
-    <a class="nav-cta" href="https://t.me/ZodProxy" target="_blank" rel="noopener">عضویت در کانال</a>
-  </div>
-</nav>
-
-<header class="hero">
-  <div class="wrap">
-    <span class="pill"><span class="dot"></span> سرورها فعال هستند • آپدیت روزانه</span>
-    <h1>کانفیگ‌های <span class="grad-txt">پرسرعت و رایگان</span><br>برای عبور از فیلترینگ</h1>
-    <p>به کانال <b>ZodProxy</b> بپیوندید و هر روز جدیدترین کانفیگ‌های V2Ray، VLESS، Reality، Trojan و Shadowsocks را با کمترین پینگ و بیشترین پایداری دریافت کنید — کاملاً رایگان.</p>
-    <div class="btns">
-      <a class="btn btn-main" href="https://t.me/ZodProxy" target="_blank" rel="noopener">📨 ورود به کانال تلگرام</a>
-      <a class="btn btn-ghost" href="#features">امکانات کانال</a>
-    </div>
-  </div>
-</header>
-
-<section style="padding-top:0">
-  <div class="wrap">
-    <div class="stats">
-      <div class="stat"><b>۲۴/۷</b><span>اتصال پایدار</span></div>
-      <div class="stat"><b>روزانه</b><span>کانفیگ تازه</span></div>
-      <div class="stat"><b>+۵</b><span>پروتکل متنوع</span></div>
-      <div class="stat"><b>۱۰۰٪</b><span>رایگان</span></div>
-    </div>
-  </div>
-</section>
-
-<section id="features">
-  <div class="wrap">
-    <div class="sec-head">
-      <h2>چرا ZodProxy؟</h2>
-      <p>هر آنچه برای یک اتصال سریع، امن و بی‌دردسر نیاز دارید، یکجا.</p>
-    </div>
-    <div class="grid">
-      <div class="card"><div class="ico">🚀</div><h3>سرعت فوق‌العاده</h3><p>کانفیگ‌های بهینه‌شده با کمترین پینگ، مناسب استریم، دانلود و گیمینگ بدون قطعی.</p></div>
-      <div class="card"><div class="ico">🔄</div><h3>آپدیت روزانه</h3><p>هر روز کانفیگ‌های تازه روی سرورهای جدید قرار می‌گیرد تا همیشه اتصال برقرار باشد.</p></div>
-      <div class="card"><div class="ico">🆓</div><h3>کاملاً رایگان</h3><p>بدون هیچ هزینه، اشتراک یا ثبت‌نام؛ کافیست عضو کانال شوید و کپی کنید.</p></div>
-      <div class="card"><div class="ico">🛡️</div><h3>امن و خصوصی</h3><p>پروتکل‌های مدرن مثل Reality و TLS برای حفظ حریم خصوصی و اتصال مخفی و مطمئن.</p></div>
-      <div class="card"><div class="ico">📱</div><h3>همه دستگاه‌ها</h3><p>سازگار با اندروید، iOS، ویندوز، مک و لینوکس از طریق محبوب‌ترین اپلیکیشن‌ها.</p></div>
-      <div class="card"><div class="ico">🌐</div><h3>عبور از فیلترینگ</h3><p>کانفیگ‌هایی که در شرایط سخت شبکه هم پایدار می‌مانند و قطع نمی‌شوند.</p></div>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <div class="sec-head">
-      <h2>پروتکل‌های پشتیبانی‌شده</h2>
-      <p>تنوع کامل پروتکل‌ها برای هر شرایط شبکه.</p>
-    </div>
-    <div class="chips">
-      <span class="chip">VLESS</span>
-      <span class="chip">VMess</span>
-      <span class="chip">Reality</span>
-      <span class="chip">Trojan</span>
-      <span class="chip">Shadowsocks</span>
-      <span class="chip">Hysteria2</span>
-      <span class="chip">TUIC</span>
-      <span class="chip">WireGuard</span>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <div class="sec-head">
-      <h2>در ۳ قدم متصل شوید</h2>
-      <p>بدون دانش فنی، در کمتر از یک دقیقه.</p>
-    </div>
-    <div class="steps">
-      <div class="step"><div class="step-n">۱</div><h3>عضویت در کانال</h3><p>روی دکمه «ورود به کانال تلگرام» بزنید و عضو کانال ZodProxy شوید.</p></div>
-      <div class="step"><div class="step-n">۲</div><h3>کپی کانفیگ</h3><p>جدیدترین کانفیگ یا لینک اشتراک (Subscription) را از کانال کپی کنید.</p></div>
-      <div class="step"><div class="step-n">۳</div><h3>اتصال در اپ</h3><p>کانفیگ را در اپ موردنظر Paste کرده و دکمه اتصال را بزنید. تمام!</p></div>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <div class="sec-head">
-      <h2>اپلیکیشن‌های پیشنهادی</h2>
-      <p>با این کلاینت‌ها کانفیگ‌ها را روی هر دستگاهی اجرا کنید.</p>
-    </div>
-    <div class="apps">
-      <span class="app">📱 v2rayNG</span>
-      <span class="app">🦊 NekoBox</span>
-      <span class="app">🍏 Streisand</span>
-      <span class="app">🌀 Hiddify</span>
-      <span class="app">⚔️ Clash Meta</span>
-      <span class="app">🚀 V2Box</span>
-      <span class="app">💻 Nekoray</span>
-    </div>
-  </div>
-</section>
-
-<section>
-  <div class="wrap">
-    <div class="cta">
-      <h2>همین حالا به جمع ما بپیوند</h2>
-      <p>کانفیگ‌های پرسرعت، رایگان و آپدیت روزانه فقط یک کلیک با شما فاصله دارد.</p>
-      <a class="btn btn-main" href="https://t.me/ZodProxy" target="_blank" rel="noopener">📨 عضویت در کانال ZodProxy</a>
-    </div>
-  </div>
-</section>
-
-<footer>
-  <div class="wrap">
-    <div class="brand"><span class="logo">⚡</span><span>ZodProxy</span></div>
-    <p>کانال تخصصی پروکسی و کانفیگ‌های پرسرعت • <a class="tg" href="https://t.me/ZodProxy" target="_blank" rel="noopener">@ZodProxy</a></p>
-    <p style="margin-top:8px;font-size:12.5px;opacity:.7">© ZodProxy — تمامی کانفیگ‌ها صرفاً جهت عبور از محدودیت‌ها و استفاده شخصی است.</p>
-  </div>
-</footer>
-
-</body>
-</html>
-'''
-
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    # صفحهٔ اصلی تبلیغاتی کانال ZodProxy — یک رشتهٔ استاتیک که فقط یک‌بار هنگام بالا آمدن لود می‌شود.
-    # هدر Cache-Control تا مرورگر/CDN کش کند و فشار تکراری روی CPU/رم نیاید.
-    return HTMLResponse(content=LANDING_HTML, headers={"Cache-Control": "public, max-age=3600"})
+@app.get("/")
+async def root(): return Response(content=b"OK", media_type="text/plain")
 
 @app.get("/health")
 async def health(): return {"status": "ok", "connections": len(user_last_active)}
