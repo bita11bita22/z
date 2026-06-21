@@ -699,7 +699,9 @@ async def stats_updater():
             if info.get("status") != "active": continue
             ip_limit = int(info.get("ip_limit", 0) or 0)
             if ip_limit > 0:
-                real_ips = [ip for ip in active_connections.get(uid, {}) if ip != "local"]
+                # \u0641\u0642\u0637 \u0622\u06cc\u200c\u067e\u06cc\u200c\u0647\u0627\u06cc \u0639\u0645\u0648\u0645\u06cc \u0648\u0627\u0642\u0639\u06cc \u0645\u0644\u0627\u06a9 \u0633\u0642\u0641 \u062f\u0633\u062a\u06af\u0627\u0647 \u0647\u0633\u062a\u0646\u062f. \u0631\u0648\u06cc Railway (\u0641\u0642\u0637 CGNAT) \u0627\u06cc\u0646 \u0644\u06cc\u0633\u062a \u062e\u0627\u0644\u06cc \u0645\u06cc\u200c\u0645\u0627\u0646\u062f
+                # \u0648 ip_limit \u0628\u06cc\u200c\u0627\u062b\u0631 \u0645\u06cc\u200c\u0634\u0648\u062f (\u0686\u0648\u0646 \u0634\u0645\u0627\u0631\u0634 \u0648\u0627\u0642\u0639\u06cc \u0645\u0645\u06a9\u0646 \u0646\u06cc\u0633\u062a) \u062a\u0627 \u06a9\u0627\u0631\u0628\u0631 \u0627\u0634\u062a\u0628\u0627\u0647\u06cc \u0628\u0644\u0627\u06a9 \u0646\u0634\u0648\u062f\u061b \u0631\u0648\u06cc VPS \u0628\u0627 IP \u0627\u062e\u062a\u0635\u0627\u0635\u06cc \u062f\u0631\u0633\u062a \u06a9\u0627\u0631 \u0645\u06cc\u200c\u06a9\u0646\u062f.
+                real_ips = [ip for ip in active_connections.get(uid, {}) if ip != "local" and is_public_ip(ip)]
                 if len(real_ips) > ip_limit:
                     LINKS[uid]["status"] = "blocked"
                     needs_restart = True
@@ -942,8 +944,13 @@ def build_active_configs():
             for user in users:
                 uid = user["uid"]
                 ips = active_connections.get(uid, {})
-                ip_count = len(ips) if ips else 1
-                items.append({"config": config_label, "label": user["label"], "ip_count": ip_count, "attributed": True})
+                public_ips = [ip for ip in ips if is_public_ip(ip)]
+                if public_ips:
+                    # \u0622\u06cc\u200c\u067e\u06cc \u0648\u0627\u0642\u0639\u06cc \u06a9\u0627\u0631\u0628\u0631 \u062f\u0631 \u062f\u0633\u062a\u0631\u0633 \u0627\u0633\u062a (\u0645\u062b\u0644\u0627\u064b VPS \u0628\u0627 IP \u0627\u062e\u062a\u0635\u0627\u0635\u06cc) \u2192 \u0634\u0645\u0627\u0631\u0634 \u062f\u0642\u06cc\u0642 \u0645\u062b\u0644 \u0628\u0642\u06cc\u0647\u0654 \u067e\u0631\u0648\u062a\u06a9\u0644\u200c\u0647\u0627
+                    items.append({"config": config_label, "label": user["label"], "ip_count": len(public_ips), "attributed": True})
+                else:
+                    # \u067e\u0634\u062a \u067e\u0631\u0648\u06a9\u0633\u06cc NAT \u067e\u0644\u062a\u0641\u0631\u0645 (\u0645\u062b\u0644 Railway) \u2192 \u0622\u06cc\u200c\u067e\u06cc \u0648\u0627\u0642\u0639\u06cc \u0642\u0627\u0628\u0644\u200c\u062a\u0634\u062e\u06cc\u0635 \u0646\u06cc\u0633\u062a\u061b \u0641\u0642\u0637 \u00ab\u0622\u0646\u0644\u0627\u06cc\u0646\u00bb \u0628\u062f\u0648\u0646 \u0639\u062f\u062f \u06af\u0645\u0631\u0627\u0647\u200c\u06a9\u0646\u0646\u062f\u0647
+                    items.append({"config": config_label, "label": user["label"], "ip_count": 0, "attributed": True, "reality_no_ip": True})
         else:
             ip_count = len(protocol_connections.get(proto, {})) or len(users)
             if len(users) == 1:
@@ -973,7 +980,9 @@ def format_active_configs_text(items):
     if not items: return "هیچ کانفیگ آنلاینی وجود ندارد."
     lines = []
     for it in items:
-        if it["attributed"]:
+        if it.get("reality_no_ip"):
+            lines.append(f"\U0001f50c \u06a9\u0627\u0646\u0641\u06cc\u06af {it['config']} \u06a9\u0627\u0631\u0628\u0631 {it['label']} \u0622\u0646\u0644\u0627\u06cc\u0646 (\u067e\u0634\u062a \u067e\u0631\u0648\u06a9\u0633\u06cc \u067e\u0644\u062a\u0641\u0631\u0645 \u2014 \u0634\u0645\u0627\u0631\u0634 IP \u062f\u0631 \u062f\u0633\u062a\u0631\u0633 \u0646\u06cc\u0633\u062a)")
+        elif it["attributed"]:
             lines.append(f"🔌 کانفیگ {it['config']} کاربر {it['label']} آنلاین با {it['ip_count']} ایپی فعال که بهش وصلن")
         else:
             lines.append(f"🔌 کانفیگ {it['config']} — کاربران ({it['label']}) آنلاین، مجموعاً {it['ip_count']} ایپی فعال متصل")
@@ -1207,7 +1216,9 @@ async def api_links(request: Request, token: Optional[str] = Cookie(None)):
     if not auth_check(token): raise HTTPException(401)
     domain = get_domain(request); out = []
     for uid, info in LINKS.items():
-        conn_count = len(active_connections.get(uid, {}))
+        # \u0641\u0642\u0637 \u0622\u06cc\u200c\u067e\u06cc\u200c\u0647\u0627\u06cc \u0639\u0645\u0648\u0645\u06cc \u0648\u0627\u0642\u0639\u06cc \u0634\u0645\u0631\u062f\u0647 \u0645\u06cc\u200c\u0634\u0648\u0646\u062f. \u0631\u0648\u06cc Railway \u0622\u062f\u0631\u0633 Reality \u0647\u0645\u06cc\u0634\u0647 CGNAT \u062f\u0627\u062e\u0644\u06cc (100.64.x) \u0627\u0633\u062a
+        # \u06a9\u0647 \u0622\u06cc\u200c\u067e\u06cc \u0648\u0627\u0642\u0639\u06cc \u06a9\u0627\u0631\u0628\u0631 \u0646\u06cc\u0633\u062a\u061b \u0628\u0627 \u0641\u06cc\u0644\u062a\u0631 \u0639\u0645\u0648\u0645\u06cc\u060c \u0639\u062f\u062f \u063a\u0644\u0637 (\u062a\u0627 \u06f2\u06f2 = \u0633\u0627\u06cc\u0632 pool \u0644\u0628\u0647\u0654 Railway) \u0646\u0634\u0627\u0646 \u062f\u0627\u062f\u0647 \u0646\u0645\u06cc\u200c\u0634\u0648\u062f.
+        conn_count = len([ip for ip in active_connections.get(uid, {}) if is_public_ip(ip)])
         data_limit = info.get("data_limit", 0)
         used_traffic = user_traffic.get(uid, 0)
         remaining_data = (data_limit - used_traffic) if data_limit else 0
@@ -1484,7 +1495,7 @@ var totalConn=d.active_ips||0;
 document.getElementById('reality-total-badge').textContent=totalConn+' ایپی فعال';
 var rc=document.getElementById('reality-connections');
 if(configs.length===0){rc.innerHTML='<div style="color:var(--muted);font-size:13px;text-align:center;padding:20px">هیچ کانفیگ آنلاینی وجود ندارد</div>';}
-else{var html='';configs.forEach(function(it){var icon=it.attributed?'🔥':'🌐';var sub=it.attributed?('کاربر '+it.label+' آنلاین'):('کاربران آنلاین: '+it.label);html+='<div class="reality-user-row">';html+='<div class="reality-user-name">'+icon+' '+it.config+' <span class="reality-conn-count">'+it.ip_count+' ایپی فعال</span></div>';html+='<div class="reality-ip-list"><span class="reality-ip-tag" style="direction:rtl">'+sub+'</span></div></div>';});rc.innerHTML=html;}
+else{var html='';configs.forEach(function(it){var icon=it.attributed?'🔥':'🌐';var cnt=it.reality_no_ip?'آنلاین':(it.ip_count+' ایپی فعال');var sub=it.reality_no_ip?('کاربر '+it.label+' آنلاین — شمارش IP پشت پروکسی پلتفرم در دسترس نیست'):(it.attributed?('کاربر '+it.label+' آنلاین'):('کاربران آنلاین: '+it.label));html+='<div class="reality-user-row">';html+='<div class="reality-user-name">'+icon+' '+it.config+' <span class="reality-conn-count">'+cnt+'</span></div>';html+='<div class="reality-ip-list"><span class="reality-ip-tag" style="direction:rtl">'+sub+'</span></div></div>';});rc.innerHTML=html;}
 }catch(e){}}
 function fmtBytes(b){if(b<1024)return b+'B';if(b<1024*1024)return(b/1024).toFixed(1)+'KB';if(b<1024**3)return(b/1024/1024).toFixed(2)+'MB';return(b/1024**3).toFixed(2)+'GB';}
 async function loadUsers(){try{const r=await fetch('/api/links',{credentials:'include'});if(r.status===401){location.href='__LOGIN_URL__';return}const d=await r.json();const tb=document.getElementById('users-tbody');if(!d.links.length){tb.innerHTML='<tr><td colspan="6" style="text-align:center;padding:24px">کاربری وجود ندارد</td></tr>';return;}allUsers={};tb.innerHTML=d.links.map(function(u){allUsers[u.uuid]=u;let status_badge='<span class="badge badge-blue">🟢 '+(u.online_ips>0?(u.online_ips+' اتصال'):'آنلاین')+'</span>';if(u.status==='expired')status_badge='<span class="badge badge-red">منقضی</span>';if(u.status==='blocked')status_badge='<span class="badge badge-yellow">مسدود شده</span>';let limits='';if(u.data_limit>0)limits+='<span class="badge badge-yellow">باقی‌مانده: '+fmtBytes(u.remaining_data)+'</span><br>';if(u.remaining_days>0)limits+='<span class="badge badge-yellow">'+u.remaining_days+' روز</span>';if(u.ip_limit>0)limits+='<span class="badge badge-yellow">سقف دستگاه: '+u.ip_limit+'</span>';return '<tr><td><span class="badge badge-green">'+u.label+'</span><br>'+limits+'</td><td><span style="font-size: 10px">'+u.uuid.substring(0,8)+'…</span></td><td>'+u.created_at+'</td><td>'+fmtBytes(u.used_traffic)+'</td><td>'+status_badge+'</td><td><button class="btn-sm" onclick="showLinks(\''+u.uuid+'\')">🔗 لینک</button><button class="btn-sm" onclick="extendUser(\''+u.uuid+'\')">➕ ۳۰ روز</button><button class="btn-sm" onclick="editUser(\''+u.uuid+'\')">✏️ ویرایش</button><button class="btn-sm" onclick="delUser(\''+u.uuid+'\')">حذف</button></td></tr>';}).join('');}catch(e){}}
